@@ -1118,6 +1118,7 @@ def _run_prompt_submit(
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None, report_ownership_refusal: bool = True,
     synthetic_turn: bool = False) -> bool:
+    synthetic_turn = synthetic_turn or bool(display_kind)
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
