@@ -418,7 +418,9 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
         image_paths = list(session.get("attached_images", []))
         if image_paths:
             session["attached_images"] = []  # claim now so a later paste isn't consumed when the turn yields
-    plain_text = _coerce_message_text(text).strip() if not image_paths and _is_text_only_busy_payload(text) else ""
+    owner_typed = not turn_author and not display_kind
+    plain_text = (
+        _coerce_message_text(text).strip() if owner_typed and not image_paths and _is_text_only_busy_payload(text) else "")
     # Text-only corrections steer/redirect in place when supported; media payloads and older agents fall through to
     # the proven interrupt + queue path.
     if plain_text and agent is not None:
