@@ -212,3 +212,45 @@ def test_the_shared_gateway_preview_restart_agent_runs_a_synthetic_turn(monkeypa
     monkeypatch.setattr("gateway.session_local_recovery.transcript_target", lambda authority, ref: None)
     asyncio.run(side.preview_restart(connection, ref, {"url": "http://localhost:5173", "context": "console text"}))
     assert seen["synthetic_turn"] is True
+
+
+def test_a_hidden_prompt_queued_before_a_backend_restart_is_retired_and_never_replayed_as_typed_text(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(srv, "_get_db", lambda: db)
+    monkeypatch.setattr(srv, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(srv, "_start_agent_build", lambda *args: None)
+    monkeypatch.setattr(srv, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(srv, "_maybe_schedule_auto_continue", lambda *args: None)
+    monkeypatch.setattr(srv, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(srv, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(srv, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "_interrupt_busy_session", lambda *a, **k: None)
+    created = srv.handle_request({"id": "c", "method": "session.create", "params": {"cols": 80, "source": "desktop"}})
+    sid, key = created["result"]["session_id"], created["result"]["stored_session_id"]
+    resumed_sid = None
+    try:
+        session = srv._sessions[sid]
+        assert srv._ensure_session_db_row(session) is not False
+        with session["history_lock"]:
+            session["running"] = True
+            srv._start_inflight_turn(session, "turn in flight")
+        db.append_message(key, "user", content="turn in flight")
+        assert srv._handle_busy_submit("r", sid, session, "approve: merge #7", "ws", queued=True,
+                                       display_kind="hidden")["result"]["status"] == "queued"
+        assert session["queued_prompt"]["synthetic_turn"] is True
+        assert any("merge #7" in str(row["content"]) for row in db.get_messages_as_conversation(key))
+
+        srv._sessions.pop(sid)
+        resumed = srv.handle_request({"id": "r2", "method": "session.resume", "params": {"session_id": key, "source": "desktop"}})
+        resumed_sid = resumed["result"]["session_id"]
+        revived = srv._sessions[resumed_sid]
+
+        assert not revived.get("queued_prompt")
+        assert srv._drain_queued_prompt("d", resumed_sid, revived) is False
+        assert not any("merge #7" in str(row["content"]) for row in db.get_messages_as_conversation(key))
+    finally:
+        srv._sessions.pop(sid, None)
+        srv._sessions.pop(resumed_sid, None)
+        db.close()

@@ -1067,7 +1067,8 @@ def build_turn_context(
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
-    agent._synthetic_turn = is_synthetic_turn(synthetic_turn, getattr(agent, "platform", None))
+    agent._synthetic_turn = is_synthetic_turn(
+        synthetic_turn or bool(persist_user_display_kind), getattr(agent, "platform", None))
     agent._typed_message, agent._context_expanded = parse_turn_origin(typed_message, context_expanded)
 
     # Recover a rotated session before binding log/turn ids or copying client history so

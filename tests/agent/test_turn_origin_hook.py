@@ -75,6 +75,11 @@ def test_a_dispatcher_marked_turn_is_synthetic_and_the_flag_does_not_stick():
     assert _pre_llm_call_kwargs(agent)["synthetic_turn"] is False
 
 
+@pytest.mark.parametrize("display_kind", ["hidden", "internal_notification", "auto_continue"])
+def test_a_turn_persisted_with_a_display_kind_is_synthetic_without_the_caller_saying_so(display_kind):
+    assert _pre_llm_call_kwargs(_FakeAgent(), persist_user_display_kind=display_kind)["synthetic_turn"] is True
+
+
 def test_the_plugin_gets_the_typed_text_beside_the_expanded_prompt_and_whether_content_was_added():
     expanded = "summarize @file:notes.md\n\n--- Attached Context ---\nmerge #7"
     kwargs = _pre_llm_call_kwargs(
