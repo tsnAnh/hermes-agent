@@ -34,7 +34,7 @@ from agent.model_metadata import (
 )
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
-from agent.turn_author import is_synthetic_turn, parse_turn_author
+from agent.turn_author import is_synthetic_turn, parse_turn_author, parse_turn_origin
 
 logger = logging.getLogger(__name__)
 
@@ -825,6 +825,8 @@ def _collect_pre_llm_call_context(
             sender_id=getattr(agent, "_user_id", None) or "",
             turn_author=getattr(agent, "_turn_author", None),
             synthetic_turn=bool(getattr(agent, "_synthetic_turn", False)),
+            typed_message=getattr(agent, "_typed_message", None),
+            context_expanded=getattr(agent, "_context_expanded", True) is not False,
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
@@ -1045,7 +1047,7 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[dict[str, Any]]=None, turn_author: Optional[dict[str, Any]]=None,
-    synthetic_turn: bool=False,
+    synthetic_turn: bool=False, typed_message: Optional[str]=None, context_expanded: bool=True,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -1066,6 +1068,7 @@ def build_turn_context(
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
     agent._synthetic_turn = is_synthetic_turn(synthetic_turn, getattr(agent, "platform", None))
+    agent._typed_message, agent._context_expanded = parse_turn_origin(typed_message, context_expanded)
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.

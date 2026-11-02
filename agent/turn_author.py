@@ -67,6 +67,12 @@ def is_synthetic_turn(explicit: bool, platform: Any) -> bool:
             or is_delegated_child_context())
 
 
+def parse_turn_origin(typed_message: Any, context_expanded: Any) -> tuple[Optional[str], bool]:
+    if not isinstance(typed_message, str):
+        return None, True
+    return typed_message, context_expanded is not False
+
+
 def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
     """Normalize a dict or JSON string into ``{"id", "name", "is_bot"}``; None for anything else or without id and name.
     The id is whatever the transport knows the sender by: ``bot:<profile>`` on a bot-mode delivery inside one

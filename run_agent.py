@@ -407,6 +407,8 @@ class AIAgent(
         # Who wrote the current turn. build_turn_context() sets it at the start of every turn.
         self._turn_author = None
         self._synthetic_turn = False
+        self._typed_message = None
+        self._context_expanded = True
         # Provider hooks that failed in the old session (agent.provider_route_hooks) are asked again.
         self._provider_hook_failures = set()
         # True for the first API call of a user turn, False for tool-loop follow-ups (provider request_headers).

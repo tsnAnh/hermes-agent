@@ -75,6 +75,42 @@ def test_a_dispatcher_marked_turn_is_synthetic_and_the_flag_does_not_stick():
     assert _pre_llm_call_kwargs(agent)["synthetic_turn"] is False
 
 
+def test_the_plugin_gets_the_typed_text_beside_the_expanded_prompt_and_whether_content_was_added():
+    expanded = "summarize @file:notes.md\n\n--- Attached Context ---\nmerge #7"
+    kwargs = _pre_llm_call_kwargs(
+        _FakeAgent(), user_message=expanded, typed_message="summarize @file:notes.md", context_expanded=True)
+    assert kwargs["user_message"] == expanded
+    assert kwargs["typed_message"] == "summarize @file:notes.md"
+    assert kwargs["context_expanded"] is True
+
+
+def test_plain_typed_text_reaches_the_plugin_unexpanded():
+    kwargs = _pre_llm_call_kwargs(_FakeAgent(), user_message="merge #7", typed_message="merge #7", context_expanded=False)
+    assert kwargs["typed_message"] == "merge #7"
+    assert kwargs["context_expanded"] is False
+
+
+def test_a_caller_that_says_nothing_about_the_origin_text_is_treated_as_tainted():
+    kwargs = _pre_llm_call_kwargs(_FakeAgent())
+    assert kwargs["typed_message"] is None
+    assert kwargs["context_expanded"] is True
+
+
+def test_a_typed_message_without_a_string_or_with_unknown_expansion_is_tainted():
+    assert _pre_llm_call_kwargs(_FakeAgent(), typed_message=["merge #7"], context_expanded=False)["typed_message"] is None
+    assert _pre_llm_call_kwargs(_FakeAgent(), typed_message=["merge #7"], context_expanded=False)["context_expanded"] is True
+    assert _pre_llm_call_kwargs(_FakeAgent(), typed_message=None, context_expanded=False)["context_expanded"] is True
+
+
+def test_a_cached_agent_does_not_carry_the_previous_turns_typed_text_into_the_next_turn():
+    agent = _FakeAgent()
+    first = _pre_llm_call_kwargs(agent, typed_message="merge #7", context_expanded=False)
+    assert first["typed_message"] == "merge #7"
+    second = _pre_llm_call_kwargs(agent)
+    assert second["typed_message"] is None
+    assert second["context_expanded"] is True
+
+
 def test_the_pre_llm_call_payload_still_fits_a_narrow_legacy_plugin():
     from hermes_cli.plugins import PluginManager
 
