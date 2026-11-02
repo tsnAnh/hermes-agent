@@ -126,7 +126,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                     _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
                     _emit("message.start", sid)
                 render_notification(announce, platform="tui", diagnostic=diagnostic)
-                _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
+                _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue", synthetic_turn=True,
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)

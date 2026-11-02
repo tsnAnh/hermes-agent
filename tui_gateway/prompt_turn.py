@@ -428,7 +428,7 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
     release ``running``."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        _run_prompt_submit(rid, sid, session, prompt, synthetic_turn=True)
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -747,7 +747,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
 def _invoke_agent(
     sid: str, session: dict, st: _TurnRun, prompt: Any, run_message: Any, streamer,
     images: list[str], display_kind: str | None, display_metadata: dict | None,
-    turn_author: dict | None = None, text: Any = None) -> None:
+    turn_author: dict | None = None, text: Any = None, synthetic_turn: bool = False) -> None:
     """Wire the streaming callbacks and run the conversation into ``st.result``.
     ``text`` is the turn's raw submit, matched against the row staged by prompt.submit."""
     agent = st.agent
@@ -805,6 +805,8 @@ def _invoke_agent(
         run_kwargs["persist_user_display_metadata"] = display_metadata
     if turn_author and "turn_author" in run_params:
         run_kwargs["turn_author"] = turn_author
+    if synthetic_turn and "synthetic_turn" in run_params:
+        run_kwargs["synthetic_turn"] = True
     if "prelude" in run_params:
         from agent.onboarding_session import onboarding_prelude
         prelude = onboarding_prelude(agent, st.history)
@@ -1114,7 +1116,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None, report_ownership_refusal: bool = True) -> bool:
+    turn_author: dict | None = None, report_ownership_refusal: bool = True,
+    synthetic_turn: bool = False) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1180,7 +1183,7 @@ def _run_prompt_submit(
             prompt, run_message, cols, streamer = prepared
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata, turn_author, text)
+                display_metadata, turn_author, text, synthetic_turn)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)

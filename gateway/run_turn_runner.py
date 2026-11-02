@@ -998,6 +998,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 kwargs["persist_user_message"] = persist_user_message_override
             elif observed_group_context:
                 kwargs["persist_user_message"] = ctx.message
+            if ctx.persist_user_display_kind and _accepts_keyword(agent.run_conversation, "synthetic_turn"):
+                kwargs["synthetic_turn"] = True
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
