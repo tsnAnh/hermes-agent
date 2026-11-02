@@ -744,8 +744,29 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     run_message = _prepend_note(run_message, reaction_notes)
     st.context_expanded = st.context_expanded or bool(reaction_notes) or _carries_voice_transcript(session)
     voice_turn = bool(session.pop("voice_turn", False))
+    st.context_expanded = st.context_expanded or voice_turn
     agent._voice_turn_pending = voice_turn  # auxiliary.voice_chat route
     return prompt, _prepend_note(run_message, _hud_surface_note(session, voice_turn)), cols, streamer
+
+
+EXPANDED_SENDS_KEY = "_expanded_sends"
+EXPANDED_SENDS_KEPT = 8
+
+
+def _note_expanded_send(session: dict | None, text: Any) -> None:
+    if session is None or not isinstance(text, str) or not text.strip():
+        return
+    sends = session.setdefault(EXPANDED_SENDS_KEY, [])
+    sends.append(text.strip())
+    del sends[:-EXPANDED_SENDS_KEPT]
+
+
+def _claim_expanded_send(session: dict, text: str) -> bool:
+    sends = session.get(EXPANDED_SENDS_KEY) or []
+    if text.strip() not in sends:
+        return False
+    sends.remove(text.strip())
+    return True
 
 
 def _carries_voice_transcript(session: dict) -> bool:
@@ -817,7 +838,7 @@ def _invoke_agent(
         run_kwargs["synthetic_turn"] = True
     if not synthetic_turn and isinstance(text, str) and "typed_message" in run_params:
         run_kwargs["typed_message"] = text
-        run_kwargs["context_expanded"] = st.context_expanded
+        run_kwargs["context_expanded"] = _claim_expanded_send(session, text) or st.context_expanded
     if "prelude" in run_params:
         from agent.onboarding_session import onboarding_prelude
         prelude = onboarding_prelude(agent, st.history)
@@ -1129,7 +1150,7 @@ def _run_prompt_submit(
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None, report_ownership_refusal: bool = True,
     synthetic_turn: bool = False) -> bool:
-    synthetic_turn = synthetic_turn or bool(display_kind)
+    synthetic_turn = synthetic_turn or bool(display_kind) or terminal_callback is not None
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by

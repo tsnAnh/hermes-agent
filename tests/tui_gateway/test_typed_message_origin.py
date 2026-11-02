@@ -1,9 +1,3 @@
-"""A plugin sees the owner's raw submit beside the expanded prompt, and whether anything else rode along.
-
-``@file:`` references, attached images and quoted reactions put outside text into the prompt the hook reads;
-``typed_message`` stays exactly what the person typed so a guard never mistakes that text for approval.
-"""
-
 from __future__ import annotations
 
 import io
@@ -164,3 +158,31 @@ def test_the_compute_host_child_derives_the_typed_message_from_the_frame_text(mo
         srv._sessions.pop("s1", None)
         host.close()
     assert [(s["typed"], s["expanded"]) for s in seen] == [("read @file:notes.md", True), ("merge #7", False)]
+
+
+def test_a_spoken_turn_marks_the_text_expanded(turn_env):
+    seen = []
+    srv._run_prompt_submit("r", "sid", _session(_recording_agent(seen), voice_turn=True), "merge #7")
+    assert seen[0]["typed"] == "merge #7"
+    assert seen[0]["expanded"] is True
+
+
+def test_a_hosted_room_prompt_is_a_synthetic_turn_without_typed_text(turn_env):
+    seen = []
+    srv._run_prompt_submit("r", "sid", _session(_recording_agent(seen)), "room task: merge #7", terminal_callback=lambda payload: None)
+    assert seen[0]["typed"] is None
+    assert seen[0]["synthetic"] is True
+
+
+def test_a_message_a_slash_command_built_is_expanded_once_it_comes_back_as_a_prompt(turn_env):
+    seen = []
+    session = _session(_recording_agent(seen))
+    srv._sessions["sid-slash"] = session
+    try:
+        built = srv._methods["command.dispatch"]("r", {"name": "queue", "arg": "merge #7", "session_id": "sid-slash"})
+        assert built["result"]["message"] == "merge #7"
+        srv._run_prompt_submit("r", "sid-slash", session, "merge #7")
+        srv._run_prompt_submit("r", "sid-slash", session, "merge #7")
+    finally:
+        srv._sessions.pop("sid-slash", None)
+    assert [(s["typed"], s["expanded"]) for s in seen] == [("merge #7", True), ("merge #7", False)]

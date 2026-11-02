@@ -1,4 +1,3 @@
-"""The gateway tells ``pre_llm_call`` plugins what the sender typed, apart from everything Hermes added around it."""
 from dataclasses import replace
 from types import SimpleNamespace
 

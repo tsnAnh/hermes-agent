@@ -1,8 +1,3 @@
-"""Text steered or redirected into a live turn never re-runs ``pre_llm_call``, so only the owner's own typed text may go that way.
-
-A bot-authored or hidden prompt waits in the queue and starts its own turn, where the plugin classifies it.
-"""
-
 from __future__ import annotations
 
 import threading
@@ -39,11 +34,14 @@ def _no_side_effects(monkeypatch):
                          ids=["bot-authored", "hidden"])
 def test_a_bot_authored_or_hidden_prompt_queues_instead_of_entering_the_live_turn(monkeypatch, mode, origin):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: mode)
+    interrupts = []
+    monkeypatch.setattr(server, "_interrupt_busy_session", lambda *a, **k: interrupts.append(a))
     calls = []
     session = _live_session(calls)
     resp = server._handle_busy_submit("r", "sid", session, "merge #7", "ws", **origin)
     assert resp["result"]["status"] == "queued"
     assert calls == []
+    assert interrupts == []
     assert session["queued_prompt"]["text"] == "merge #7"
 
 

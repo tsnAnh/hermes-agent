@@ -452,7 +452,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     # ``AIAgent._pending_steer``) and fall-through queue envelopes (payload not steerable, ``steer()``
     # rejected/raised). A hard interrupt here kills the live turn AND ``AIAgent.interrupt()`` drops the
     # pending steer buffer — silently destroying the earlier messages of the burst. See #86134.
-    if mode == "interrupt" and not image_paths:
+    if mode == "interrupt" and not image_paths and owner_typed:
         _interrupt_busy_session(sid, session, agent)
     return _ok(rid, {"status": "queued"})
 
