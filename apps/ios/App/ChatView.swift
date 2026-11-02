@@ -26,10 +26,15 @@ struct ChatView: View {
                 .padding(.top, 8)
             }
             .defaultScrollAnchor(.bottom)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .scrollDismissesKeyboard(.interactively)
             .accessibilityIdentifier("chatScreen")
-            .onChange(of: model.rows) {
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Composer(botName: model.bot.displayName, draft: $draft, focused: $composerFocused) {
+                    model.send(draft)
+                    draft = ""
+                    withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
             }
         }
         .overlay {
@@ -38,12 +43,6 @@ struct ChatView: View {
                     .controlSize(.large)
                     .accessibilityLabel(Text("Reconnecting"))
                     .accessibilityIdentifier("reconnectingIndicator")
-            }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            Composer(botName: model.bot.displayName, draft: $draft, focused: $composerFocused) {
-                model.send(draft)
-                draft = ""
             }
         }
         .toolbar {
