@@ -1,5 +1,10 @@
 import { hermesApi } from '@/hermes'
 import {
+  registerFocusedConversationClassifier,
+  rememberBotChatFromMainWindow
+} from '@/store/last-conversation-recorder'
+import { type BotChatRestorer, registerBotChatRestorer } from '@/store/last-conversation-restore'
+import {
   pinSession,
   setPinnedSessionOrder,
   setSidebarSessionOrderIds,
@@ -42,6 +47,12 @@ function liveSessionId(storedSessionId: string): string {
  *  session ids as a sidebar row slot carries them; a live id is resolved to
  *  the same row through the app's lineage matcher. */
 export const sessionsHost = {
+  rememberBotChat: rememberBotChatFromMainWindow,
+
+  registerFocusedConversationClassifier,
+
+  registerBotChatRestorer: (restorer: BotChatRestorer): (() => void) => registerBotChatRestorer(restorer),
+
   /** Pin or unpin a session — the row's ⇧-click / context-menu action. A
    *  pinned session moves into the Pinned section on the next render.
    *  `index` slots the pin at that position in the Pinned list (a drop

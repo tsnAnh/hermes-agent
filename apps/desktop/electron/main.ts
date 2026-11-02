@@ -354,22 +354,28 @@ import { localSkinProfileKey, registerLocalSkinIpc } from './local-skin'
 import { ACTIVE_LOG_POLL_MS, planLogRotation, reclaimActiveLogIfOversized } from './log-rotation'
 import { registerMachineProfile } from './machine-profile'
 import { createMainProcessLagWatchdog } from './main-process-lag-watchdog'
-import { activateWindow, ensureMainWindow, shouldQuitOnLastChatClosed } from './main-window-lifecycle'
+import { activateWindow, ensureMainWindow, handleAppActivate, shouldQuitOnLastChatClosed } from './main-window-lifecycle'
 import {
+  applyManagedSshRecoveryAttempt,
   assertManagedUpdatePreflightClear,
   executeManagedRemoteUpdate,
   fenceManagedSshBootstrapPublication,
   joinManagedUpdatesForApply,
   ManagedConnectionUpdateGate,
   managedSshDrainBlocker,
+  managedSshRecoveryLogLines,
+  managedSshRecoveryRecordFor,
   managedSshRecoveryScopes,
+  managedSshRewrapBootstrapError,
+  managedSshScopeBelongsToConnection,
   managedSshScopeRole,
   managedSshTokenPersistencePlan,
   managedSshUpdateAllRow,
-  MAX_MANAGED_SSH_RECOVERY_ATTEMPTS,
+  openManagedSshRecoveryDials,
   recoverManagedSshScopes,
   refusedManagedSshUpdate,
   type RemoteUpdateTarget,
+  replaceManagedSshRecoveryRecord,
   runManagedSshUpdate,
   validateCorrelationId,
   waitForManagedRemoteClearance,
@@ -1983,6 +1989,8 @@ let connectionConfigCache = null
 let connectionConfigCacheMtime = null
 let connectionRegistryCache = null
 let connectionRegistryCacheMtime = null
+// Sticky: a later save rewrites connections.json, yet absence must stay unproven.
+let connectionRegistryDegraded = false
 const remoteHeaderSessions = new WeakSet<object>()
 const remoteWsHeaderStore = createRemoteWsHeaderStore()
 const previewWatchers = new Map()
@@ -8527,6 +8535,7 @@ function readDesktopConnectionsRegistry() {
     // (#94246: recovery must never be data loss).
     preserveCorruptRegistrySidecar()
     registry = normalizeRegistry(null)
+    connectionRegistryDegraded = true
   }
 
   if (registry?.quarantined?.length) {
@@ -8634,6 +8643,7 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
     launchMode: registry.launchMode,
     lastUsed: registry.lastUsed,
     secureTokenStorage,
+    degraded: connectionRegistryDegraded,
     connections: registry.connections.map(sanitizeRegistryConnection),
     // Surface quarantined-entry NOTICES only (reason + best-effort label) —
     // the raw entries can carry token envelopes and stay in the file (#94246).
@@ -9189,12 +9199,14 @@ const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PA
 // mid-transaction so the next launch can restore every drained scope.
 const managedConnectionUpdateGate = new ManagedConnectionUpdateGate(
   connectionId =>
-    readManagedSshRecoveryRecords().find(record => record.connectionId === connectionId)?.correlationId || null
+    managedSshRecoveryRecordFor(readManagedSshRecoveryRecords(), connectionId)?.correlationId || null,
+  connectionId => Boolean(managedSshRecoveryRecordFor(readManagedSshRecoveryRecords(), connectionId)?.clearedAt)
 )
 
 const managedConnectionUpdates = new Map<string, Promise<any>>()
 const managedConnectionRecoveries = new Map<string, Promise<void>>()
 const managedPrimaryRestoreOwners = new Map<string, { correlationId: string; profile: string; source: any }>()
+const MANAGED_RECOVERY_QUIT_JOIN_MS = 5_000
 let managedUpdateQuitWait: Promise<unknown> | null = null
 let managedUpdateQuitWaitDone = false
 
@@ -9307,8 +9319,7 @@ function persistManagedSshRecovery(source, correlationId, scopes) {
   const prefix = backendScopePrefix(source.id)
   const recoveryScopes = managedSshRecoveryScopes(scopes, prefix)
 
-  const records = readManagedSshRecoveryRecords().filter(record => record.connectionId !== source.id)
-  records.push({
+  const records = replaceManagedSshRecoveryRecord(readManagedSshRecoveryRecords(), {
     connectionId: source.id,
     correlationId: validateCorrelationId(correlationId),
     createdAt: new Date().toISOString(),
@@ -9319,6 +9330,7 @@ function persistManagedSshRecovery(source, correlationId, scopes) {
     // credentials after a Settings edit.
     source
   })
+
   writeManagedSshRecoveryRecords(records)
 }
 
@@ -9337,17 +9349,10 @@ function markManagedSshRecoveryLaunching(connectionId, correlationId) {
   writeManagedSshRecoveryRecords(records)
 }
 
-function recordManagedSshRecoveryAttempt(connectionId, correlationId, attempts) {
-  const records = readManagedSshRecoveryRecords()
-
-  const index = records.findIndex(
-    record => record.connectionId === connectionId && record.correlationId === correlationId
+function recordManagedSshRecoveryAttempt(connectionId, correlationId, attempts, scopes) {
+  writeManagedSshRecoveryRecords(
+    applyManagedSshRecoveryAttempt(readManagedSshRecoveryRecords(), connectionId, correlationId, attempts, scopes)
   )
-
-  if (index >= 0) {
-    records[index] = { ...records[index], attempts }
-    writeManagedSshRecoveryRecords(records)
-  }
 }
 
 function clearManagedSshRecovery(connectionId, correlationId) {
@@ -9810,10 +9815,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       }
     }
 
-    const err = new Error(error.message) as any
-    err.sshError = error.kind || 'unknown'
-    err.isSshBootstrap = true
-    throw err
+    throw managedSshRewrapBootstrapError(error)
   }
 
   try {
@@ -11316,7 +11318,7 @@ async function recoverManagedSshUpdate(record) {
 
   const recoveryCorrelation = record.correlationId
 
-  if (!managedConnectionUpdateGate.claim(connectionId, recoveryCorrelation)) {
+  if (!managedConnectionUpdateGate.claim(connectionId, recoveryCorrelation, Boolean(record.clearedAt))) {
     return
   }
 
@@ -11326,12 +11328,20 @@ async function recoverManagedSshUpdate(record) {
     try {
       transport = await openManagedSshUpdateTransport(record.source)
 
-      const { attempts, disposition, results } = await recoverManagedSshScopes<any>({
+      const { aborted, attempts, disposition, outcomes } = await recoverManagedSshScopes<any>({
         attempts: record.attempts ?? 0,
         scopes: record.scopes,
+        ownsScope: scope => managedSshScopeBelongsToConnection(connectionId, scope),
         awaitClearance: () =>
           waitForManagedRemoteClearance(transport!.target, record.correlationId, {
             requireTerminal: record.phase === 'launching'
+          }),
+        isAborted: () => appQuitting,
+        openDials: () =>
+          openManagedSshRecoveryDials(managedConnectionUpdateGate, connectionId, recoveryCorrelation, {
+            log: sshRememberLog,
+            read: readManagedSshRecoveryRecords,
+            write: writeManagedSshRecoveryRecords
           }),
         afterClearance: async () => {
           await transport!.close()
@@ -11344,29 +11354,13 @@ async function recoverManagedSshUpdate(record) {
               ? ensureManagedSshBackendAtKey(record.source, scope.profile, scope.key, recoveryCorrelation, 'profile')
               : ensureManagedSshBackend(record.source, scope.profile, recoveryCorrelation),
         completeRecovery: async () => clearManagedSshRecovery(connectionId, record.correlationId),
-        recordFailedAttempt: async next => recordManagedSshRecoveryAttempt(connectionId, record.correlationId, next)
+        recordFailedAttempt: async (next, remaining) =>
+          recordManagedSshRecoveryAttempt(connectionId, record.correlationId, next, remaining)
       })
 
-      const unrestored = record.scopes
-        .filter((_scope, index) => results[index]?.status === 'rejected')
-        .map(scope => scope.profile)
-
-      if (disposition === 'complete') {
-        sshRememberLog(
-          `[ssh-update] restored ${record.scopes.length} scope(s) from durable recovery for ${connectionId}`
-        )
-      } else if (disposition === 'abandon') {
-        sshRememberLog(
-          `[ssh-update] durable recovery for ${connectionId} stopped after ${attempts} attempt(s); ` +
-            `connection released with ${unrestored.length} scope(s) not restored (${unrestored.join(', ')}). ` +
-            'Reconnecting starts them again.'
-        )
-      } else {
-        sshRememberLog(
-          `[ssh-update] durable recovery for ${connectionId} left ${unrestored.length} scope(s) pending ` +
-            `(attempt ${attempts} of ${MAX_MANAGED_SSH_RECOVERY_ATTEMPTS}); will retry next launch`
-        )
-      }
+      managedSshRecoveryLogLines({ aborted, attempts, connectionId, disposition, outcomes, scopes: record.scopes }).forEach(
+        line => sshRememberLog(line)
+      )
     } catch (error: any) {
       sshRememberLog(
         `[ssh-update] durable recovery for ${connectionId} remains pending: ${String(error?.message || error)}`
@@ -17917,11 +17911,7 @@ app.whenReady().then(() => {
     // window when only secondary session windows remain open.
     // #130810: a dock/taskbar activate is explicit, so restore with
     // activation (restore + show + focus), not the ambient showInactive path.
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      createWindow()
-    } else {
-      activateWindow(mainWindow)
-    }
+    handleAppActivate(mainWindow, { createWindow, activate: activateWindow })
   })
 })
 
@@ -18128,13 +18118,18 @@ app.on('before-quit', event => {
     event.preventDefault()
 
     if (!managedUpdateQuitWait) {
-      managedUpdateQuitWait = waitForManagedUpdateOperations(() => [
-        ...managedConnectionUpdates.values(),
-        ...managedConnectionRecoveries.values()
-      ]).finally(() => {
-        managedUpdateQuitWaitDone = true
-        app.quit()
-      })
+      // A recovery can wait minutes on remote clearance; its durable record already
+      // covers a quit, so only a live update transaction holds the quit open.
+      managedUpdateQuitWait = waitForManagedUpdateOperations(() => managedConnectionUpdates.values())
+        .then(() =>
+          waitForManagedUpdateOperations(() => managedConnectionRecoveries.values(), {
+            timeoutMs: MANAGED_RECOVERY_QUIT_JOIN_MS
+          })
+        )
+        .finally(() => {
+          managedUpdateQuitWaitDone = true
+          app.quit()
+        })
     }
 
     return
