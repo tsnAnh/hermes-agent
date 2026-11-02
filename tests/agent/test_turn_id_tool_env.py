@@ -184,9 +184,9 @@ def test_a_delegate_task_child_never_gets_a_turn_id(home, hooks):
     try:
         agent = agent_for(stub, enabled_toolsets=["terminal", "delegation"], platform="tui")
         agent.run_conversation("delegate it")
+        assert wait_until(probe.exists, timeout=20)
     finally:
         stub.close()
-    assert wait_until(probe.exists, timeout=20)
     assert probe.read_text() == "[unset]"
 
 
