@@ -188,3 +188,58 @@ def test_a_delegate_task_child_never_gets_a_turn_id(home, hooks):
         stub.close()
     assert wait_until(probe.exists, timeout=20)
     assert probe.read_text() == "[unset]"
+
+
+@pytest.fixture()
+def one_session():
+    from tools.approval_context import reset_current_session_key, set_current_session_key
+
+    token = set_current_session_key("turn-id-session")
+    yield
+    reset_current_session_key(token)
+
+
+def execute_code_script(code):
+    def script(request):
+        return None if tool_results(request) else tool_call("execute_code", {"code": code})
+
+    return script
+
+
+def test_a_later_turns_execute_code_cell_sees_that_turns_id_not_the_one_the_kernel_started_in(home, hooks, one_session):
+    stub = StubModel(execute_code_script(f'import os; print(os.environ.get("{TURN_ID_ENV}", "unset"))'))
+    try:
+        agent = agent_for(stub, enabled_toolsets=["code_execution"], platform="tui")
+        first = printed(agent.run_conversation("one"))
+        second = printed(agent.run_conversation("two", conversation_history=[]))
+    finally:
+        stub.close()
+    ids = [call["turn_id"] for call in hooks["pre_llm_call"]]
+    assert ids[0] != ids[1]
+    assert [first, second] == ids
+    assert TURN_ID_ENV not in os.environ
+
+
+def test_a_delegate_task_childs_execute_code_cell_never_sees_a_turn_id_even_in_a_kernel_started_by_a_turn(home, hooks, one_session):
+    probe = home / "child-cell.txt"
+    cell = f'import os; open({str(probe)!r}, "w").write("[" + os.environ.get("{TURN_ID_ENV}", "unset") + "]")'
+
+    def script(request):
+        is_child = "CHILD_GOAL" in json.dumps(request["messages"][1:2])
+        if is_child:
+            return None if tool_results(request) else tool_call("execute_code", {"code": cell}, "child-call")
+        if tool_results(request):
+            return None
+        if "delegate" in json.dumps(request["messages"][-1]):
+            return tool_call("delegate_task", {"goal": "CHILD_GOAL run the cell"})
+        return tool_call("execute_code", {"code": "x = 1"})
+
+    stub = StubModel(script)
+    try:
+        agent = agent_for(stub, enabled_toolsets=["code_execution", "delegation"], platform="tui")
+        agent.run_conversation("start the kernel")
+        agent.run_conversation("delegate it", conversation_history=[])
+        assert wait_until(probe.exists, timeout=20)
+    finally:
+        stub.close()
+    assert probe.read_text() == "[unset]"

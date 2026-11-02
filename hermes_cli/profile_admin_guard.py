@@ -59,13 +59,13 @@ def agent_tool_env(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
     if token:
         env[GRANT_ENV] = token
     env.pop(TURN_ID_ENV, None)
-    turn_id = _tool_turn_id()
+    turn_id = tool_turn_id()
     if turn_id:
         env[TURN_ID_ENV] = turn_id
     return env
 
 
-def _tool_turn_id() -> str:
+def tool_turn_id() -> str:
     from agent.delegation_context import is_delegated_child_context
     from tools.approval_context import get_current_turn_id
 
