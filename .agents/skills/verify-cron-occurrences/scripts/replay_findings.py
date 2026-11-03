@@ -1,3 +1,4 @@
+import atexit
 import os
 import shutil
 import sys
@@ -8,13 +9,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
 SCRATCH_HOME = tempfile.mkdtemp(prefix="replay_findings_")
+atexit.register(shutil.rmtree, SCRATCH_HOME, ignore_errors=True)
 os.environ["HERMES_HOME"] = SCRATCH_HOME
 
 from cron import constants, jobs
+import cron.executions
 import cron.extra_fire
 import cron.missed_runs
 import cron.occurrences
 import cron.quota_hold
+import cron.scheduler_gateway_gate
 import cron.unreachable_retry
 import hermes_time
 
@@ -203,28 +207,116 @@ def scenario_fa(root):
     return reproduced, evidence
 
 
+def scenario_fc(root):
+    evidence = []
+    clock = Clock(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC))
+    procs = Processes()
+    original_gate = cron.scheduler_gateway_gate._gateway_unavailable
+    with jobs.use_cron_store(root):
+        install(clock, procs)
+        procs.select("gateway")
+        job = jobs.create_job(prompt="replay", schedule="every 1h", name="replay-job")
+        job_id = job["id"]
+        s1 = stored(job_id)["next_run_at"]
+        s1_dt = datetime.fromisoformat(s1)
+        canonical_s1 = cron.occurrences.scheduled_instant(s1)
+        evidence.append(f"S1={s1} canonical={canonical_s1}")
+
+        clock.value = s1_dt + timedelta(seconds=5)
+        due_snapshot(job_id, evidence, "step1 (gateway)")
+        require(jobs.advance_next_runs([job_id]) == 1, "step1: advance_next_runs did not advance")
+        snap = note(evidence, "step1 stored (gateway died before its worker claimed)", job_id)
+        require(snap["pending_slot"] == s1, f"step1: pending_slot {snap['pending_slot']} != S1 {s1}")
+
+        clock.value = s1_dt + timedelta(hours=2)
+        procs.select("crontab")
+        cron.scheduler_gateway_gate._gateway_unavailable = lambda home: "the gateway is absent"
+        try:
+            due = [j for j in jobs.get_due_jobs() if j["id"] == job_id]
+            require(len(due) == 1, f"step2: get_due_jobs returned {len(due)} snapshots for the job, expected 1")
+            require(due[0].get("_scheduled_instant") == canonical_s1,
+                    f"step2: _scheduled_instant {due[0].get('_scheduled_instant')} != {canonical_s1}")
+            before = note(evidence, "step2 stored (crontab scan)", job_id)
+            require(datetime.fromisoformat(before["next_run_at"]) > s1_dt,
+                    f"step2: scan did not fast-forward next_run_at ({before['next_run_at']})")
+            kept = cron.scheduler_gateway_gate.refuse_agent_jobs_without_gateway(due)
+        finally:
+            cron.scheduler_gateway_gate._gateway_unavailable = original_gate
+        after = note(evidence, "step3 stored (after headless refusal)", job_id)
+        error = stored(job_id).get("last_fire_error")
+        evidence.append(f"step3: kept={len(kept)} last_fire_error={error}")
+
+        reproduced = (
+            not kept
+            and after["pending_slot"] is None
+            and datetime.fromisoformat(after["next_run_at"]) > s1_dt
+            and bool(error)
+        )
+    return reproduced, evidence
+
+
+def scenario_fd(root):
+    evidence = []
+    clock = Clock(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC))
+    procs = Processes()
+    with jobs.use_cron_store(root):
+        install(clock, procs)
+        job_id, s1 = new_job(clock, procs)
+        s1_dt = datetime.fromisoformat(s1)
+        evidence.append(f"S1={s1}")
+
+        clock.value = s1_dt + timedelta(seconds=10)
+        due_snapshot(job_id, evidence, "step1 (A)")
+        require(jobs.advance_next_runs([job_id]) == 1, "step1: advance_next_runs did not advance")
+        procs.running_owner = "A"
+        snap = note(evidence, "step1 stored (A dispatch queued, no claim)", job_id)
+        require(snap["pending_slot"] == s1, f"step1: pending_slot {snap['pending_slot']} != S1 {s1}")
+        require(snap["fire_claim_by"] is None, "step1: unexpected fire_claim before worker start")
+        s2 = snap["next_run_at"]
+        s2_dt = datetime.fromisoformat(s2)
+        require(s2_dt > s1_dt, f"step1: next_run_at {s2} not after S1")
+        evidence.append(f"S2={s2}")
+
+        clock.value = s2_dt + timedelta(seconds=10)
+        evidence.append(f"step2: clock advanced to {clock.value.isoformat()} (worker queued a whole period)")
+        before = note(evidence, "step2 stored (before claim)", job_id)
+
+        require(bool(jobs.claim_job_for_fire(job_id)), "step3: claim_job_for_fire returned falsy")
+        after = note(evidence, "step3 stored (after claim)", job_id)
+        require(after["pending_slot"] is None, f"step3: pending_slot still {after['pending_slot']}")
+        statuses = [row["status"] for row in cron.executions.list_executions(job_id=job_id)]
+        evidence.append(f"step3: ledger statuses for the job: {statuses}")
+
+        reproduced = datetime.fromisoformat(after["next_run_at"]) > s2_dt and "missed" not in statuses
+        evidence.append(f"S2 next_run_at before claim={before['next_run_at']} after claim={after['next_run_at']}")
+
+        clock.value = datetime.fromisoformat(after["next_run_at"]) + timedelta(minutes=20)
+        jobs.get_due_jobs()
+        control = [row["status"] for row in cron.executions.list_executions(job_id=job_id)]
+        require("missed" in control, "control: a stale scan did not book a missed row, so the ledger check proves nothing")
+        evidence.append(f"control: a stale scan books a gap, ledger statuses now {control}")
+    return reproduced, evidence
+
+
 def main():
-    scenarios = (("F-A", scenario_fa), ("F-B", scenario_fb))
+    scenarios = (("F-A", scenario_fa), ("F-B", scenario_fb), ("F-C", scenario_fc), ("F-D", scenario_fd))
     results = {}
     harness_failed = False
-    try:
-        for name, runner in scenarios:
-            root = Path(SCRATCH_HOME) / name.lower()
-            root.mkdir(parents=True, exist_ok=True)
-            try:
-                results[name] = runner(root)
-            except HarnessError as exc:
-                harness_failed = True
-                print(f"{name} HARNESS ERROR: {exc}", file=sys.stderr)
-        for name, _ in scenarios:
-            if name not in results:
-                continue
-            reproduced, evidence = results[name]
-            print(f"{name} {'REPRODUCED' if reproduced else 'NOT REPRODUCED'}")
-            for line in evidence:
-                print(f"  {line}")
-    finally:
-        shutil.rmtree(SCRATCH_HOME, ignore_errors=True)
+    for name, runner in scenarios:
+        root = Path(SCRATCH_HOME) / name.lower()
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            results[name] = runner(root)
+        except HarnessError as exc:
+            harness_failed = True
+            print(f"{name} HARNESS ERROR: {exc}", file=sys.stderr)
+    for name, _ in scenarios:
+        if name not in results:
+            continue
+        reproduced, evidence = results[name]
+        print(f"{name} {'REPRODUCED' if reproduced else 'NOT REPRODUCED'}")
+        for line in evidence:
+            print(f"  {line}")
     if harness_failed:
         return EXIT_HARNESS_ERROR
     return EXIT_REPRODUCED if all(r for r, _ in results.values()) else EXIT_NOT_REPRODUCED

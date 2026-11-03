@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -31,7 +32,7 @@ MIN_JAVA_MAJOR = 11
 TLC_TIMEOUT_SECONDS = 900
 
 SKIPPED_FIELDS = frozenset({"kind", "type_comment"})
-FACT_TOKEN = re.compile(r"^(?P<name>\w+)(?:\((?:(?P<keyword>\w+)=|'(?P<const>[^']*)')\))?$")
+FACT_TOKEN = re.compile(r"^(?:(?P<receiver>\w+)\.)?(?P<name>\w+)(?:\((?:(?P<keyword>\w+)=|'(?P<const>[^']*)')\))?$")
 SYNC_LINE = re.compile(r"(?m)^Sync commit: ([0-9a-f]{40})$")
 
 
@@ -80,7 +81,7 @@ def ensure_tla_jar(explicit: str | None) -> Path:
     try:
         with urllib.request.urlopen(TLA_URL, timeout=120) as response, partial.open("wb") as handle:
             shutil.copyfileobj(response, handle)
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         partial.unlink(missing_ok=True)
         raise SystemExit(
             f"cannot download {TLA_URL}: {exc}\n"
@@ -167,14 +168,16 @@ def canonical(node: object) -> str:
     return repr(node)
 
 
-def find_definition(tree: ast.Module, name: str) -> ast.AST | None:
+def top_level_bindings(tree: ast.Module, name: str) -> list[ast.AST]:
+    found: list[ast.AST] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            return node
+            found.append(node)
+            continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
         if any(isinstance(target, ast.Name) and target.id == name for target in targets):
-            return node
-    return None
+            found.append(node)
+    return found
 
 
 def callee_name(call: ast.Call) -> str | None:
@@ -186,7 +189,19 @@ def callee_name(call: ast.Call) -> str | None:
 
 def call_matches(call: ast.Call, token: str) -> bool:
     parsed = FACT_TOKEN.match(token)
-    if not parsed or callee_name(call) != parsed.group("name"):
+    if not parsed:
+        return False
+    receiver = parsed.group("receiver")
+    if receiver:
+        func = call.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == parsed.group("name")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == receiver
+        ):
+            return False
+    elif callee_name(call) != parsed.group("name"):
         return False
     if parsed.group("keyword"):
         return any(keyword.arg == parsed.group("keyword") for keyword in call.keywords)
@@ -228,7 +243,11 @@ def check_code(coverage: dict) -> tuple[list[str], dict[str, str]]:
         except SyntaxError as exc:
             problems.append(f"MISSING {key}: file does not parse ({exc.msg} at line {exc.lineno})")
             continue
-        definition = find_definition(tree, entry["name"])
+        bindings = top_level_bindings(tree, entry["name"])
+        definition = bindings[-1] if bindings else None
+        if len(bindings) > 1:
+            lines = ", ".join(str(node.lineno) for node in bindings)
+            problems.append(f"DUPLICATE {key}: bound {len(bindings)} times at top level (lines {lines}); the last one wins")
         if definition is None:
             problems.append(f"MISSING {key}: definition moved or renamed; re-read the model action(s) {entry['actions']}")
             continue
@@ -250,19 +269,48 @@ def read_skill_sync() -> str | None:
     return match.group(1) if match else None
 
 
+def run_git(*args: str) -> subprocess.CompletedProcess | None:
+    if not shutil.which("git"):
+        return None
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def check_sync(coverage: dict) -> list[str]:
     in_skill = read_skill_sync()
     if in_skill != coverage["sync_commit"]:
         return [f"SYNC    SKILL.md says {in_skill} but coverage.json says {coverage['sync_commit']}; move them together"]
-    if not shutil.which("git"):
-        return []
-    known = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{in_skill}^{{commit}}"],
-        capture_output=True, stdin=subprocess.DEVNULL, timeout=60, check=False,
-    )
-    if known.returncode != 0:
+    known = run_git("cat-file", "-e", f"{in_skill}^{{commit}}")
+    if known is not None and known.returncode != 0:
         print(f"note: sync commit {in_skill[:12]} is not in this clone's history (shallow?); fetch it to diff against it")
     return []
+
+
+def warn_unusual_sync(coverage: dict, sync: str) -> None:
+    known = run_git("cat-file", "-e", f"{sync}^{{commit}}")
+    if known is None:
+        return
+    if known.returncode != 0:
+        print(f"note: {sync[:12]} is not a commit git can resolve here; recording it anyway")
+    else:
+        head = run_git("rev-parse", "HEAD")
+        if head is not None and head.returncode == 0 and head.stdout.strip() != sync:
+            print(f"note: {sync[:12]} differs from HEAD {head.stdout.strip()[:12]}")
+    files = sorted({entry["file"] for entry in coverage["covered"]})
+    status = run_git("status", "--porcelain", "--", *files)
+    if status is not None and status.returncode == 0 and status.stdout.strip():
+        dirty = ", ".join(line[3:] for line in status.stdout.splitlines())
+        print(f"note: uncommitted changes under covered files ({dirty}); the fingerprints record the working tree")
+
+
+def write_text_lf(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
 
 
 def record(coverage: dict, sync: str) -> None:
@@ -273,27 +321,35 @@ def record(coverage: dict, sync: str) -> None:
     for entry in coverage["covered"]:
         entry["sha256"] = hashes[f"{entry['file']}::{entry['name']}"]
     coverage["sync_commit"] = sync
-    COVERAGE_FILE.write_text(json.dumps(coverage, indent=2) + "\n", encoding="utf-8")
+    warn_unusual_sync(coverage, sync)
+    write_text_lf(COVERAGE_FILE, json.dumps(coverage, indent=2) + "\n")
     text = SKILL_FILE.read_text(encoding="utf-8")
-    SKILL_FILE.write_text(SYNC_LINE.sub(f"Sync commit: {sync}", text, count=1), encoding="utf-8")
+    write_text_lf(SKILL_FILE, SYNC_LINE.sub(f"Sync commit: {sync}", text, count=1))
     print(f"recorded {len(coverage['covered'])} fingerprints and sync commit {sync}")
 
 
 def run_replay() -> tuple[str, str]:
     scratch = tempfile.mkdtemp(prefix="verify-cron-home-")
     env = dict(os.environ, HERMES_HOME=scratch)
-    probe = subprocess.run(
-        [sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r}); import cron.jobs"],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env, timeout=120, check=False,
-    )
-    shutil.rmtree(scratch, ignore_errors=True)
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r}); import cron.jobs"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env, timeout=120, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "error", "timed out"
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     if probe.returncode != 0:
         reason = (probe.stderr.strip().splitlines() or ["import failed"])[-1]
         return "skipped", f"Hermes environment not importable by {sys.executable}: {reason}"
-    done = subprocess.run(
-        [sys.executable, "-I", str(REPLAY_FILE)], capture_output=True, text=True,
-        stdin=subprocess.DEVNULL, check=False, timeout=120,
-    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-I", str(REPLAY_FILE)], capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, check=False, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return "error", "timed out"
     verdicts = [line for line in done.stdout.splitlines() if line.startswith("F-")]
     errors = [line for line in done.stderr.splitlines() if "HARNESS ERROR" in line]
     detail = " | ".join(verdicts + errors) or done.stderr.strip()[-200:]
@@ -312,13 +368,22 @@ def main() -> int:
     parser.add_argument("--model-only", action="store_true")
     parser.add_argument("--code-only", action="store_true")
     parser.add_argument("--no-replay", action="store_true")
+    parser.add_argument("--require-replay", action="store_true", help="count a skipped replay as a failure")
     parser.add_argument("--out", help="directory for TLC output (default: a new temp dir)")
     parser.add_argument("--tla2tools", help="path to the pinned tla2tools.jar")
     parser.add_argument("--record", action="store_true", help="re-fingerprint covered code (needs --sync)")
     parser.add_argument("--sync", help="commit SHA the verification was confirmed against")
     args = parser.parse_args()
 
+    if args.model_only and args.code_only:
+        parser.error("--model-only and --code-only cannot be combined")
     coverage = load_coverage()
+    wanted = set(args.only.split(",")) if args.only else None
+    if wanted:
+        valid = [entry["cfg"] for entry in coverage["runs"]]
+        unknown = sorted(wanted - set(valid))
+        if unknown:
+            parser.error(f"unknown --only name(s) {', '.join(unknown)}; valid names: {', '.join(valid)}")
     if args.record:
         if not args.sync or not re.fullmatch(r"[0-9a-f]{40}", args.sync):
             parser.error("--record needs --sync <40-hex commit SHA>")
@@ -337,10 +402,9 @@ def main() -> int:
             print("  every covered definition matches its recorded fingerprint and call-order facts")
 
     if not args.code_only:
-        jar = ensure_tla_jar(args.tla2tools)
         java = find_java()
+        jar = ensure_tla_jar(args.tla2tools)
         out_root = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="verify-cron-tlc-"))
-        wanted = set(args.only.split(",")) if args.only else None
         print(f"MODEL  TLC {TLA_RELEASE} (sha256 verified), output in {out_root}")
         for entry in coverage["runs"]:
             if wanted and entry["cfg"] not in wanted:
@@ -357,7 +421,7 @@ def main() -> int:
         if not args.no_replay and not wanted:
             status, detail = run_replay()
             print(f"REPLAY {status}: {detail}")
-            if status in ("changed", "error"):
+            if status in ("changed", "error") or (status == "skipped" and args.require_replay):
                 failures += 1
 
     still_open = ", ".join(open_findings)

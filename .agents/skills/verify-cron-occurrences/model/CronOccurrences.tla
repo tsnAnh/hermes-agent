@@ -1,9 +1,10 @@
 ---- MODULE CronOccurrences ----
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS None, N, MaxCrashes, MaxGen,
+CONSTANTS None, N, MaxCrashes, MaxGen, StaleAfter,
           StampOnDispatch, ClaimClearsStamp, AdvanceBeforeDispatch,
-          HonorLiveForeignStamp, StampLeaseCanExpire, RunsFinishWithinSlot, TickIsInstant
+          HonorLiveForeignStamp, StampLeaseCanExpire, RunsFinishWithinSlot,
+          CrontabRefusesWithoutGateway, CollapseIsLogged, TickIsInstant
 
 Slots == 1..N
 Procs == {"gateway", "crontab"}
@@ -11,10 +12,10 @@ Incarnations == 1..MaxGen
 Owners == Procs \X Incarnations
 
 VARIABLES now, next, stamp, stampExpired, claim, fired, settled,
-          alive, gen, held, tickLock, phase, disp, crashes
+          alive, gen, held, tickLock, phase, disp, crashes, restored
 
 vars == <<now, next, stamp, stampExpired, claim, fired, settled,
-          alive, gen, held, tickLock, phase, disp, crashes>>
+          alive, gen, held, tickLock, phase, disp, crashes, restored>>
 
 Me(p) == <<p, gen[p]>>
 IdAlive(id) == alive[id[1]] /\ gen[id[1]] = id[2]
@@ -32,11 +33,12 @@ TypeOK ==
     /\ settled \subseteq Slots
     /\ alive \in [Procs -> BOOLEAN]
     /\ gen \in [Procs -> Incarnations]
-    /\ held \in [Procs -> [slot : Slots, step : {"queued", "running"}] \cup {None}]
+    /\ held \in [Procs -> [slot : Slots, step : {"queued", "running"}, at : 0..N] \cup {None}]
     /\ tickLock \in Procs \cup {None}
     /\ phase \in [Procs -> {"idle", "locked", "scanned", "advanced"}]
     /\ disp \in [Procs -> 0..N]
     /\ crashes \in 0..MaxCrashes
+    /\ restored \in BOOLEAN
 
 Init ==
     /\ now = 0
@@ -53,6 +55,7 @@ Init ==
     /\ phase = [p \in Procs |-> "idle"]
     /\ disp = [p \in Procs |-> 0]
     /\ crashes = 0
+    /\ restored = FALSE
 
 AdvanceTime ==
     /\ now < N
@@ -60,7 +63,7 @@ AdvanceTime ==
     /\ RunsFinishWithinSlot => \A p \in Procs : ~Running(p)
     /\ now' = now + 1
     /\ UNCHANGED <<next, stamp, stampExpired, claim, fired, settled,
-                   alive, gen, held, tickLock, phase, disp, crashes>>
+                   alive, gen, held, tickLock, phase, disp, crashes, restored>>
 
 ExpireStamp ==
     /\ StampLeaseCanExpire
@@ -68,7 +71,7 @@ ExpireStamp ==
     /\ ~stampExpired
     /\ stampExpired' = TRUE
     /\ UNCHANGED <<now, next, stamp, claim, fired, settled,
-                   alive, gen, held, tickLock, phase, disp, crashes>>
+                   alive, gen, held, tickLock, phase, disp, crashes, restored>>
 
 Crash(p) ==
     /\ alive[p]
@@ -78,7 +81,7 @@ Crash(p) ==
     /\ phase' = [phase EXCEPT ![p] = "idle"]
     /\ tickLock' = IF tickLock = p THEN None ELSE tickLock
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<now, next, stamp, stampExpired, claim, fired, settled, gen, disp>>
+    /\ UNCHANGED <<now, next, stamp, stampExpired, claim, fired, settled, gen, disp, restored>>
 
 Restart(p) ==
     /\ ~alive[p]
@@ -86,7 +89,7 @@ Restart(p) ==
     /\ alive' = [alive EXCEPT ![p] = TRUE]
     /\ gen' = [gen EXCEPT ![p] = gen[p] + 1]
     /\ UNCHANGED <<now, next, stamp, stampExpired, claim, fired, settled,
-                   held, tickLock, phase, disp, crashes>>
+                   held, tickLock, phase, disp, crashes, restored>>
 
 AcquireTickLock(p) ==
     /\ alive[p]
@@ -95,7 +98,7 @@ AcquireTickLock(p) ==
     /\ tickLock' = p
     /\ phase' = [phase EXCEPT ![p] = "locked"]
     /\ UNCHANGED <<now, next, stamp, stampExpired, claim, fired, settled,
-                   alive, gen, held, disp, crashes>>
+                   alive, gen, held, disp, crashes, restored>>
 
 GetDueJobs(p) ==
     /\ phase[p] = "locked"
@@ -106,39 +109,64 @@ GetDueJobs(p) ==
            base == IF restore THEN stamp.slot ELSE next
            kept == IF restore THEN None ELSE stamp
            due == base <= now
-           stale == now - base >= 2
+           late == now - base
+           mayBeFresh == late < StaleAfter
+           mayBeStale == late >= StaleAfter - 1
            keptExpired == IF kept = None THEN FALSE ELSE stampExpired
-       IN \/ /\ ~due
-             /\ next' = base
-             /\ stamp' = kept
-             /\ stampExpired' = keptExpired
-             /\ phase' = [phase EXCEPT ![p] = "idle"]
-             /\ tickLock' = None
-             /\ UNCHANGED <<settled, disp>>
-          \/ /\ due
-             /\ stale
-             /\ next' = now + 1
-             /\ stamp' = kept
-             /\ stampExpired' = keptExpired
-             /\ settled' = settled \cup Span(1, now)
-             /\ phase' = [phase EXCEPT ![p] = "idle"]
-             /\ tickLock' = None
-             /\ UNCHANGED disp
-          \/ /\ due
-             /\ next' = IF stale THEN now + 1 ELSE base
-             /\ stamp' = IF StampOnDispatch THEN [slot |-> base, by |-> Me(p)] ELSE kept
-             /\ stampExpired' = IF StampOnDispatch THEN FALSE ELSE keptExpired
-             /\ disp' = [disp EXCEPT ![p] = base]
-             /\ phase' = [phase EXCEPT ![p] = "scanned"]
-             /\ UNCHANGED <<settled, tickLock>>
+           newStamp == IF StampOnDispatch THEN [slot |-> base, by |-> Me(p)] ELSE kept
+           newStampExpired == IF StampOnDispatch THEN FALSE ELSE keptExpired
+       IN /\ restored' = (restored \/ restore)
+          /\ \/ /\ ~due
+                /\ next' = base
+                /\ stamp' = kept
+                /\ stampExpired' = keptExpired
+                /\ phase' = [phase EXCEPT ![p] = "idle"]
+                /\ tickLock' = None
+                /\ UNCHANGED <<settled, disp>>
+             \/ /\ due
+                /\ mayBeStale
+                /\ next' = now + 1
+                /\ stamp' = kept
+                /\ stampExpired' = keptExpired
+                /\ settled' = settled \cup Span(1, now)
+                /\ phase' = [phase EXCEPT ![p] = "idle"]
+                /\ tickLock' = None
+                /\ UNCHANGED disp
+             \/ /\ due
+                /\ mayBeFresh
+                /\ next' = base
+                /\ stamp' = newStamp
+                /\ stampExpired' = newStampExpired
+                /\ disp' = [disp EXCEPT ![p] = base]
+                /\ phase' = [phase EXCEPT ![p] = "scanned"]
+                /\ UNCHANGED <<settled, tickLock>>
+             \/ /\ due
+                /\ mayBeStale
+                /\ next' = now + 1
+                /\ stamp' = newStamp
+                /\ stampExpired' = newStampExpired
+                /\ disp' = [disp EXCEPT ![p] = base]
+                /\ phase' = [phase EXCEPT ![p] = "scanned"]
+                /\ UNCHANGED <<settled, tickLock>>
     /\ UNCHANGED <<now, claim, fired, alive, gen, held, crashes>>
+
+RefuseHeadless(p) ==
+    /\ CrontabRefusesWithoutGateway
+    /\ p = "crontab"
+    /\ ~alive["gateway"]
+    /\ phase[p] = "scanned"
+    /\ stamp' = None
+    /\ stampExpired' = FALSE
+    /\ phase' = [phase EXCEPT ![p] = "idle"]
+    /\ tickLock' = None
+    /\ UNCHANGED <<now, next, claim, fired, settled, alive, gen, held, disp, crashes, restored>>
 
 AdvanceNextRuns(p) ==
     /\ phase[p] = "scanned"
     /\ next' = IF AdvanceBeforeDispatch THEN now + 1 ELSE next
     /\ phase' = [phase EXCEPT ![p] = "advanced"]
     /\ UNCHANGED <<now, stamp, stampExpired, claim, fired, settled,
-                   alive, gen, held, tickLock, disp, crashes>>
+                   alive, gen, held, tickLock, disp, crashes, restored>>
 
 SubmitWithGuard(p) ==
     /\ phase[p] = "advanced"
@@ -147,27 +175,28 @@ SubmitWithGuard(p) ==
     /\ IF held[p] # None
           THEN /\ settled' = settled \cup Span(disp[p], now)
                /\ UNCHANGED held
-          ELSE /\ held' = [held EXCEPT ![p] = [slot |-> disp[p], step |-> "queued"]]
+          ELSE /\ held' = [held EXCEPT ![p] = [slot |-> disp[p], step |-> "queued", at |-> now]]
                /\ UNCHANGED settled
     /\ UNCHANGED <<now, next, stamp, stampExpired, claim, fired,
-                   alive, gen, disp, crashes>>
+                   alive, gen, disp, crashes, restored>>
 
 ClaimJobForFire(p) ==
     /\ alive[p]
     /\ Queued(p)
     /\ LET d == held[p].slot
+           reach == IF CollapseIsLogged THEN now ELSE held[p].at
        IN IF claim # None /\ IdAlive(claim)
              THEN /\ held' = [held EXCEPT ![p] = None]
-                  /\ settled' = settled \cup Span(d, now)
+                  /\ settled' = settled \cup Span(d, reach)
                   /\ UNCHANGED <<next, stamp, stampExpired, claim, fired>>
              ELSE /\ claim' = Me(p)
                   /\ stamp' = IF ClaimClearsStamp THEN None ELSE stamp
                   /\ stampExpired' = IF ClaimClearsStamp THEN FALSE ELSE stampExpired
                   /\ next' = now + 1
                   /\ fired' = [fired EXCEPT ![d] = IF @ < 2 THEN @ + 1 ELSE 2]
-                  /\ settled' = settled \cup Span(1, now)
-                  /\ held' = [held EXCEPT ![p] = [slot |-> d, step |-> "running"]]
-    /\ UNCHANGED <<now, alive, gen, tickLock, phase, disp, crashes>>
+                  /\ settled' = settled \cup Span(1, reach)
+                  /\ held' = [held EXCEPT ![p] = [slot |-> d, step |-> "running", at |-> held[p].at]]
+    /\ UNCHANGED <<now, alive, gen, tickLock, phase, disp, crashes, restored>>
 
 MarkJobRun(p) ==
     /\ alive[p]
@@ -177,9 +206,9 @@ MarkJobRun(p) ==
     /\ stamp' = None
     /\ stampExpired' = FALSE
     /\ next' = now + 1
-    /\ settled' = settled \cup Span(next, now)
+    /\ settled' = IF CollapseIsLogged THEN settled \cup Span(next, now) ELSE settled
     /\ held' = [held EXCEPT ![p] = None]
-    /\ UNCHANGED <<now, fired, alive, gen, tickLock, phase, disp, crashes>>
+    /\ UNCHANGED <<now, fired, alive, gen, tickLock, phase, disp, crashes, restored>>
 
 Next ==
     \/ AdvanceTime
@@ -189,6 +218,7 @@ Next ==
            \/ Restart(p)
            \/ AcquireTickLock(p)
            \/ GetDueJobs(p)
+           \/ RefuseHeadless(p)
            \/ AdvanceNextRuns(p)
            \/ SubmitWithGuard(p)
            \/ ClaimJobForFire(p)
@@ -207,7 +237,7 @@ DispatchInFlight(p) ==
 
 NoSilentLoss == Unsettled # {} => (stamp # None \/ \E p \in Procs : DispatchInFlight(p))
 
-WitnessOrphanStamp == ~(stamp # None /\ ~IdAlive(stamp.by))
+WitnessRestore == ~restored
 
 WitnessClaimLost == ~(\E p \in Procs : Queued(p) /\ claim # None /\ IdAlive(claim))
 
