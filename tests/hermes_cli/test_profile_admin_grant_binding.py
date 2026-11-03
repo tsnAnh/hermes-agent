@@ -233,3 +233,27 @@ def test_shell_function_shadowing_hermes_cannot_spend_the_grant(tmp_path, monkey
     assert result["exit_code"] != 0, result
     assert "needs your approval" in result["output"], result
     assert victim.is_dir()
+
+
+def test_create_grant_for_an_existing_profile_cannot_delete_it(owner_approves):
+    from hermes_cli.profiles import get_profile_dir
+    get_profile_dir("shop").mkdir(parents=True)
+    token = approved_grant("hermes profile create shop", owner_approves)
+    spend(token, "create", "shop")
+    assert_refused(token, "delete", "shop")
+
+
+@pytest.mark.parametrize("command, action, name, wrong", [
+    ("hermes profile create -p base shop", "create", "shop", "base"),
+    ("hermes profile delete -p base shop -y", "delete", "shop", "base"),
+    ("hermes profile delete --profile base shop -y", "delete", "shop", "base"),
+    ("hermes bot create -p base shop", "create", "shop", "base"),
+    ("hermes mcp remove -p base srv --everywhere", "mcp_remove_everywhere", "srv", "base"),
+    ("hermes mcp add -p base srv --url https://x --replace-shared", "mcp_replace_shared", "srv", "base"),
+    ("hermes profile create --clone shop", "create", "shop", "other"),
+    ("hermes profile create --clone --description victim shop", "create", "shop", "victim"),
+    ("hermes profile create --clone --clone-from base shop", "create", "shop", "base"),
+])
+def test_grant_binds_the_real_name_not_a_flag_or_its_value(command, action, name, wrong, owner_approves):
+    spend(approved_grant(command, owner_approves), action, name)
+    assert_refused(approved_grant(command, owner_approves), action, wrong)

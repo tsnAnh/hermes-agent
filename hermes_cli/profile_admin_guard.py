@@ -190,6 +190,16 @@ def _claim_grant(token: str, action: str, subject: str) -> bool:
             and _grant_covers(data.get("bindings"), action, subject))
 
 
+def _rollback_subject(action: str, subject: str) -> str:
+    if action not in _CREATING_ACTIONS or not subject:
+        return ""
+    from hermes_cli.profiles import get_profile_dir
+    try:
+        return "" if get_profile_dir(subject).exists() else subject
+    except ValueError:
+        return ""
+
+
 def require_profile_admin_grant(action: str, name: str = "") -> None:
     if not in_agent_context():
         return
@@ -203,6 +213,6 @@ def require_profile_admin_grant(action: str, name: str = "") -> None:
         if token and _claim_grant(token, action, subject):
             if len(_spent_tokens) >= _MAX_SPENT_TOKENS:
                 _spent_tokens.pop(next(iter(_spent_tokens)))
-            _spent_tokens[token] = subject if action in _CREATING_ACTIONS else ""
+            _spent_tokens[token] = _rollback_subject(action, subject)
             return
     raise ProfileAdminDenied(_DENIED_MESSAGES.get(action, DENIED_MESSAGE))

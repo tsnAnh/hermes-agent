@@ -14,6 +14,7 @@ class _GrantBinding(NamedTuple):
     option: str | None = None
     value_options: frozenset = frozenset()
     open_ended_options: frozenset = frozenset()
+    exact_switches: frozenset = frozenset()
 
 
 _MCP_VALUE_OPTIONS = frozenset({"--url", "--command", "--auth", "--preset", "--connect-timeout"})
@@ -24,7 +25,8 @@ _MCP_REMOVE_BINDING = _GrantBinding("mcp_remove_everywhere", positional=True)
 GRANT_BINDINGS: dict[tuple[str, str], _GrantBinding] = {
     ("bot", "create"): _GrantBinding("create", positional=True, value_options=frozenset({"--display-name", "--description"})),
     ("profile", "create"): _GrantBinding(
-        "create", positional=True, value_options=frozenset({"--clone-from", "--description"})),
+        "create", positional=True, value_options=frozenset({"--clone-from", "--description"}),
+        exact_switches=frozenset({"--clone"})),
     ("profile", "import"): _GrantBinding("import", option="--name"),
     ("profile", "install"): _GrantBinding("install", option="--name"),
     ("profile", "delete"): _GrantBinding("delete", positional=True),
@@ -47,6 +49,7 @@ _PYTHON_API_ACTIONS = {
     "remove_server": "mcp_remove_everywhere",
     "_remove_mcp_server": "mcp_remove_everywhere",
 }
+_PROFILE_SELECTOR_FLAGS = frozenset({"-p", "--profile"})
 _STATIC_PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
@@ -62,6 +65,11 @@ def bound_name(binding: _GrantBinding, later_args: list[str]) -> str | None:
         if not token.startswith("-") or token == "-":
             if binding.positional:
                 return _static_name(token)
+            continue
+        if token in _PROFILE_SELECTOR_FLAGS:
+            index += 1
+            continue
+        if token.lower() in binding.exact_switches:
             continue
         inline_value = token.partition("=")[2] if "=" in token else None
         if binding.option is not None and is_flag(token, binding.option):
