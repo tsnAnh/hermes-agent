@@ -108,6 +108,7 @@ def find_java() -> str:
 
 def run_model(java: str, jar: Path, cfg: str, out_root: Path) -> ModelRun:
     workdir = out_root / cfg
+    shutil.rmtree(workdir, ignore_errors=True)
     shutil.copytree(MODEL_DIR, workdir)
     out_file = workdir / "tlc.out"
     command = [
@@ -222,7 +223,12 @@ def check_code(coverage: dict) -> tuple[list[str], dict[str, str]]:
         if not path.is_file():
             problems.append(f"MISSING {key}: file is gone; the model no longer points at code")
             continue
-        definition = find_definition(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)), entry["name"])
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError as exc:
+            problems.append(f"MISSING {key}: file does not parse ({exc.msg} at line {exc.lineno})")
+            continue
+        definition = find_definition(tree, entry["name"])
         if definition is None:
             problems.append(f"MISSING {key}: definition moved or renamed; re-read the model action(s) {entry['actions']}")
             continue
@@ -248,6 +254,8 @@ def check_sync(coverage: dict) -> list[str]:
     in_skill = read_skill_sync()
     if in_skill != coverage["sync_commit"]:
         return [f"SYNC    SKILL.md says {in_skill} but coverage.json says {coverage['sync_commit']}; move them together"]
+    if not shutil.which("git"):
+        return []
     known = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{in_skill}^{{commit}}"],
         capture_output=True, stdin=subprocess.DEVNULL, timeout=60, check=False,
@@ -259,6 +267,9 @@ def check_sync(coverage: dict) -> list[str]:
 
 def record(coverage: dict, sync: str) -> None:
     _, hashes = check_code(coverage)
+    unresolved = [f"{e['file']}::{e['name']}" for e in coverage["covered"] if f"{e['file']}::{e['name']}" not in hashes]
+    if unresolved:
+        raise SystemExit(f"cannot record, these covered definitions do not resolve: {unresolved}")
     for entry in coverage["covered"]:
         entry["sha256"] = hashes[f"{entry['file']}::{entry['name']}"]
     coverage["sync_commit"] = sync
@@ -315,6 +326,7 @@ def main() -> int:
         return 0
 
     failures = 0
+    open_findings: list[str] = []
     if not args.model_only:
         problems = check_sync(coverage) + check_code(coverage)[0]
         print(f"CODE   {len(coverage['covered'])} covered definitions, sync {coverage['sync_commit'][:12]}")
@@ -336,6 +348,8 @@ def main() -> int:
             run = run_model(java, jar, entry["cfg"], out_root)
             matched = run.outcome == entry["expect"]
             print(f"  {'OK  ' if matched else 'FAIL'} {describe(run, entry)}")
+            if matched and entry["kind"] == "finding":
+                open_findings.append(entry["finding"])
             if not matched:
                 failures += 1
                 print(f"       expected {entry['expect']}, got {run.outcome}: {entry['why']}")
@@ -346,7 +360,9 @@ def main() -> int:
             if status in ("changed", "error"):
                 failures += 1
 
-    print("RESULT " + ("PASS" if failures == 0 else f"FAIL ({failures} problem(s))"))
+    verdict = "PASS" if failures == 0 else f"FAIL ({failures} problem(s))"
+    still_open = f" (known findings still open: {', '.join(open_findings)})" if open_findings else ""
+    print(f"RESULT {verdict}{still_open}")
     return 0 if failures == 0 else 1
 
 

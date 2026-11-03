@@ -265,6 +265,15 @@
     },
     {
       "file": "cron/scheduler.py",
+      "name": "release_running_job",
+      "actions": [
+        "ClaimJobForFire",
+        "MarkJobRun"
+      ],
+      "sha256": "faebea95e4a9ad983547977fc836072d00ccd720efe3b794ddf1ff5a8db8c894"
+    },
+    {
+      "file": "cron/scheduler.py",
       "name": "_process_due_job",
       "actions": [
         "ClaimJobForFire"
@@ -355,6 +364,15 @@
         "GetDueJobs"
       ],
       "sha256": "a1cdbfd89dfc4a9f9eca261efc71c7b5b6f368d67ea355681188be08d1f2aff8"
+    },
+    {
+      "file": "cron/scheduler_ownership.py",
+      "name": "_claim_owner_is_dead",
+      "actions": [
+        "GetDueJobs",
+        "ClaimJobForFire"
+      ],
+      "sha256": "415545e56e4100772202bfb56eed387357a8d75c4ad7416779b435b015495bff"
     },
     {
       "file": "cron/constants.py",

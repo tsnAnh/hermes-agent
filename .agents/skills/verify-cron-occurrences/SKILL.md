@@ -22,7 +22,7 @@ python .agents/skills/verify-cron-occurrences/scripts/verify.py
 
 - It needs Java 11 or newer. The first run downloads TLC `v1.7.4` (`tla2tools.jar`, sha256 pinned in the script) into the user cache. Pass `--tla2tools PATH` or set `TLA2TOOLS_JAR` to supply the jar yourself. The sha256 must match.
 - It needs only the Python standard library. Run it with the repo's Python so that the last step can import `cron.jobs`. Without that environment the replay step prints `skipped` and everything else still runs.
-- It takes about 20 seconds. Exit code 0 means every result matches `coverage.json`. TLC stops at the first violation, so the state count of a violating run changes from run to run. The `envelope` count does not.
+- It takes about 20 seconds. Exit code 0 means every result matches `coverage.json`, including the two findings that are expected to fail. The last line lists them, as in `RESULT PASS (known findings still open: F-A, F-B)`. TLC stops at the first violation, so the state count of a violating run changes from run to run. The `envelope` count does not.
 - Narrow it with `--code-only`, `--model-only`, `--only cfg1,cfg2`, or `--no-replay`. `--out DIR` keeps the TLC output where you want it.
 
 Read every TLC result with the `/statechart` skill. It turns a violation into its shortest path of steps and draws the state chart when a run passes. Each run's output is `tlc.out` under the output directory that the script prints.
@@ -38,7 +38,12 @@ The script prints a `CODE` block, a `MODEL` table, and a `REPLAY` line.
 | mutant | violates | The check lost its teeth for that broken step. Fix the model, not the mutant. |
 | witness | violates | The model no longer reaches that path, so a pass on `envelope` means less. Fix the model. |
 
-A `CODE` line starting with `DRIFT` means a covered definition changed since the recorded fingerprint. `FACT` means a call order that the model relies on no longer holds, and the line names the mutant that mirrors the break. `MISSING` means a definition moved or vanished. `REPLAY error` means a step of a finding's replay no longer holds on the real code, and the harness error names the step.
+Four kinds of line mean the model may no longer describe the code.
+
+- `DRIFT`. A covered definition changed since its recorded fingerprint.
+- `FACT`. A call order that the model relies on no longer holds. The line names the mutant that mirrors the break.
+- `MISSING`. A definition moved, vanished, or no longer parses.
+- `REPLAY error`. A step of a finding's replay no longer holds on the real code. The harness error names the step.
 
 To tell a bug from a modeling error, replay the counterexample against the real code, one step per model action. If a step cannot happen, the model is wrong. Fix the model from the code, never from the result. If every step can happen, you found a bug. Report it with the counterexample. Do not weaken a property or a model to make it pass, and do not change product code unless asked.
 
@@ -54,7 +59,7 @@ F-A, a second run of one occurrence. Run by `finding_lease_expiry`.
 4. The second ticker's worker wins `claim_job_for_fire`, runs S1, and `mark_job_run` clears the claim.
 5. The gateway's queued worker starts. `claim_job_for_fire` finds no live claim and wins. S1 runs again.
 
-It needs a saturated bounded executor (`cron.max_parallel_jobs`) for over 300 s and a second ticker.
+It needs a queued worker that waits over 300 s, for example in a saturated `cron.max_parallel_jobs` pool, and a second ticker on the same store.
 
 F-B, a lost occurrence. Run by `finding_stamp_erased`.
 
@@ -72,10 +77,10 @@ Each mutant runs under the `envelope` assumptions with one step of the code remo
 
 | Mutant | Real-code edit | Counterexample |
 |---|---|---|
-| `mutant_no_stamp` | Drop `pending_slot=pending_slot_stamp(...)` from the `scan.persist(...)` call in `_evaluate_due_job`. | Slots 1 to 3 are due. A tick's scan fast-forwards `next_run_at` to slot 4 with no stamp, and the gateway dies. After the restart nothing is due and nothing ran (`NoSilentLoss`, 7 steps). |
-| `mutant_claim_keeps_stamp` | Delete `job.pop("pending_slot", None)` in `claim_job_for_fire`. | The gateway stamps slot 1, queues, claims, and dies mid-run. The second ticker restores the leftover stamp, dispatches slot 1, and claims it. Slot 1 runs twice (`AtMostOnce`, 14 steps). |
-| `mutant_no_advance` | Remove the `_advance_or_drop_recurring(...)` call from `_tick_admitted`. | The gateway queues slot 1 without advancing. The next tick sees slot 1 due again and queues a second dispatch. Both claim in turn (`AtMostOnce`, 13 steps). |
-| `mutant_restore_ignores_lease` | Remove the live-claim early return from `unclaimed_pending_slot`. | The second ticker restores the gateway's live stamp while the gateway's dispatch is queued. The gateway claims and dies, and the second ticker claims the same slot (`AtMostOnce`, 14 steps). |
+| `mutant_no_stamp` | Drop `pending_slot=pending_slot_stamp(...)` from the `scan.persist(...)` call in `_evaluate_due_job`. | Slots 1 to 3 are due. A tick's scan fast-forwards `next_run_at` to slot 4 with no stamp, and the gateway dies. After the restart nothing is due and nothing ran (`NoSilentLoss`). |
+| `mutant_claim_keeps_stamp` | Delete `job.pop("pending_slot", None)` in `claim_job_for_fire`. | The gateway stamps slot 1, queues, claims, and dies mid-run. The second ticker restores the leftover stamp, dispatches slot 1, and claims it. Slot 1 runs twice (`AtMostOnce`). |
+| `mutant_no_advance` | Remove the `_advance_or_drop_recurring(...)` call from `_tick_admitted`. | The gateway queues slot 1 without advancing. The next tick sees slot 1 due again and queues a second dispatch. Both claim in turn (`AtMostOnce`). |
+| `mutant_restore_ignores_lease` | Remove the live-claim early return from `unclaimed_pending_slot`. | The second ticker restores the gateway's live stamp while the gateway's dispatch is queued. The gateway claims and dies, and the second ticker claims the same slot (`AtMostOnce`). |
 
 The three `witness_*` runs must find a violation. That proves the dead-owner restore, the lost-claim branch, and the already-running refusal are reachable, so the `envelope` pass is not vacuous.
 
@@ -100,9 +105,10 @@ Covered files and definitions. `coverage.json` holds the fingerprints and call-o
 |---|---|
 | `cron/scheduler_tick.py` | `_tick_admitted`, `_advance_or_drop_recurring` |
 | `cron/jobs.py` | `get_due_jobs`, `_get_due_jobs_locked`, `_evaluate_due_job`, `_restore_unclaimed_slot`, `advance_next_runs`, `claim_job_for_fire`, `mark_job_run`, `_record_run_outcome`, `_advance_after_run`, `_claim_is_live` |
+| `cron/scheduler_ownership.py` | `_claim_owner_is_dead` |
 | `cron/occurrences.py` | `unclaimed_pending_slot`, `pending_slot_stamp` |
 | `cron/missed_runs.py` | `fast_forward_missed_recurring` |
-| `cron/scheduler.py` | `_submit_with_guard`, `try_register_running_job`, `_process_due_job` |
+| `cron/scheduler.py` | `_submit_with_guard`, `try_register_running_job`, `release_running_job`, `_process_due_job` |
 | `cron/constants.py` | `FIRE_CLAIM_TTL_SECONDS` |
 
 Sync commit: 48058f84b39fc81de234f815c2be9a480196933f
@@ -113,17 +119,24 @@ Sync commit: 48058f84b39fc81de234f815c2be9a480196933f
 - `envelope` assumes the stamp lease never lapses while its owner's dispatch is queued (`StampLeaseCanExpire = FALSE`). The code lets it lapse, which is F-A.
 - `envelope` assumes a run ends before the next slot comes due (`RunsFinishWithinSlot = TRUE`). The code lets runs overlap, which is F-B.
 - All runs assume a tick's scan, advance, and submit happen at one clock instant (`TickIsInstant = TRUE`). The real gap is milliseconds to a few seconds.
-- A process is dead exactly when it has crashed and not restarted. A claim stays live while its owner process lives. Cross-host owners and an explicit `HERMES_MACHINE_ID` are not modeled.
+- A process is dead exactly when it has crashed and not restarted, which is what `_claim_owner_is_dead` proves for an owner on the same host. A claim stays live while its owner process lives. Cross-host owners and an explicit `HERMES_MACHINE_ID` are not modeled.
+- `MarkJobRun` clears the store and the running-set entry in one step. The real code releases the entry a few statements later.
 - A run that claims at time t covers every occurrence due by t. An overlap refusal, a lost claim, and a catch-up-off skip count as logged policy skips.
 
 ## Not covered
 
-One-shot jobs. Manual and extra fires (`cron/extra_fire.py`). The grace and catch-up arithmetic in `cron/missed_runs.py`, which is abstracted to "stale or not". The executions ledger and `completed_occurrence`. The 30 s degraded mode of `_jobs_lock`. Unwritable-store paths (`store_health`). External providers and `fire_due`. Profile multiplexing. The executor, the restart-safe external worker, and delivery. The replay drives the store functions only, not the scheduler or its executor.
+- One-shot jobs, and manual or extra fires (`cron/extra_fire.py`).
+- The grace and catch-up arithmetic in `cron/missed_runs.py`. The model reduces it to "stale or not".
+- The executions ledger and `completed_occurrence`.
+- The 30 s degraded mode of `_jobs_lock`, and unwritable-store paths (`store_health`).
+- External providers, `fire_due`, profile multiplexing, the executor, the restart-safe external worker, and delivery.
+- Callee semantics that the model assumes, such as `compute_next_run`, `load_jobs`, `save_jobs` and `create_execution`.
+- The replay drives the store functions only, not the scheduler or its executor.
 
 ## When a change touches covered code
 
 1. Run the script before you change anything, then after. A `CODE` line names what moved.
-2. Read the diff from the sync commit with `git diff 48058f84b39fc81de234f815c2be9a480196933f -- <file>` for each flagged file. Decide for each change whether it has no effect on the model, whether a model step is no longer one indivisible step in the code, or whether the promise changed on purpose.
+2. Read the diff from the sync commit above with `git diff <sync commit> -- <file>` for each flagged file. Decide for each change whether it has no effect on the model, whether a model step is no longer one indivisible step in the code, or whether the promise changed on purpose.
 3. If the model must change, edit `model/CronOccurrences.tla` from the code, rerun, and judge the result as in "Read the result". Add a mutant for any new step that protects a property.
 4. Record the confirmation only after you have checked that the model describes the code at the new commit. Run `python .agents/skills/verify-cron-occurrences/scripts/verify.py --record --sync <commit>`. It rewrites the fingerprints in `coverage.json` and the sync commit line in this file. Never run it to silence a `DRIFT` you did not read.
 5. For changes that skipped this skill, use `/maintain-formal-verification-skill`.
