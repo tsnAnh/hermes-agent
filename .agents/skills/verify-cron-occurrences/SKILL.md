@@ -22,7 +22,7 @@ python .agents/skills/verify-cron-occurrences/scripts/verify.py
 
 - It needs Java 11 or newer. The first run downloads TLC `v1.7.4` (`tla2tools.jar`, sha256 pinned in the script) into the user cache. Pass `--tla2tools PATH` or set `TLA2TOOLS_JAR` to supply the jar yourself. The sha256 must match.
 - It needs only the Python standard library. Run it with the repo's Python so that the last step can import `cron.jobs`. Without that environment the replay step prints `skipped` and everything else still runs.
-- It takes about 20 seconds. Exit code 0 means every result matches `coverage.json`.
+- It takes about 20 seconds. Exit code 0 means every result matches `coverage.json`. TLC stops at the first violation, so the state count of a violating run changes from run to run. The `envelope` count does not.
 - Narrow it with `--code-only`, `--model-only`, `--only cfg1,cfg2`, or `--no-replay`. `--out DIR` keeps the TLC output where you want it.
 
 Read every TLC result with the `/statechart` skill. It turns a violation into its shortest path of steps and draws the state chart when a run passes. Each run's output is `tlc.out` under the output directory that the script prints.
@@ -38,7 +38,7 @@ The script prints a `CODE` block, a `MODEL` table, and a `REPLAY` line.
 | mutant | violates | The check lost its teeth for that broken step. Fix the model, not the mutant. |
 | witness | violates | The model no longer reaches that path, so a pass on `envelope` means less. Fix the model. |
 
-A `CODE` line starting with `DRIFT` means a covered definition changed since the recorded fingerprint. `FACT` means a call order that the model relies on no longer holds. `MISSING` means a definition moved or vanished.
+A `CODE` line starting with `DRIFT` means a covered definition changed since the recorded fingerprint. `FACT` means a call order that the model relies on no longer holds, and the line names the mutant that mirrors the break. `MISSING` means a definition moved or vanished. `REPLAY error` means a step of a finding's replay no longer holds on the real code, and the harness error names the step.
 
 To tell a bug from a modeling error, replay the counterexample against the real code, one step per model action. If a step cannot happen, the model is wrong. Fix the model from the code, never from the result. If every step can happen, you found a bug. Report it with the counterexample. Do not weaken a property or a model to make it pass, and do not change product code unless asked.
 

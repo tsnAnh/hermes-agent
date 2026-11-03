@@ -283,8 +283,10 @@ def run_replay() -> tuple[str, str]:
         [sys.executable, "-I", str(REPLAY_FILE)], capture_output=True, text=True,
         stdin=subprocess.DEVNULL, check=False, timeout=120,
     )
-    verdicts = " | ".join(line for line in done.stdout.splitlines() if line.startswith("F-"))
-    return {0: "reproduces", 3: "changed"}.get(done.returncode, "error"), verdicts or done.stderr.strip()[-200:]
+    verdicts = [line for line in done.stdout.splitlines() if line.startswith("F-")]
+    errors = [line for line in done.stderr.splitlines() if "HARNESS ERROR" in line]
+    detail = " | ".join(verdicts + errors) or done.stderr.strip()[-200:]
+    return {0: "reproduces", 3: "changed"}.get(done.returncode, "error"), detail
 
 
 def describe(run: ModelRun, entry: dict) -> str:
