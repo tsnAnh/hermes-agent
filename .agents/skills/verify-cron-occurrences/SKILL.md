@@ -136,7 +136,7 @@ Sync commit: 48058f84b39fc81de234f815c2be9a480196933f
 ## When a change touches covered code
 
 1. Run the script before you change anything, then after. A `CODE` line names what moved.
-2. Read the diff from the sync commit above with `git diff <sync commit> -- <file>` for each flagged file. Decide for each change whether it has no effect on the model, whether a model step is no longer one indivisible step in the code, or whether the promise changed on purpose.
+2. Read the diff from the sync commit above with `git diff <sync commit> -- <file>` for each flagged file. In a shallow clone, fetch the commit first with `git fetch --depth=1 origin <sync commit>`. Decide for each change whether it has no effect on the model, whether a model step is no longer one indivisible step in the code, or whether the promise changed on purpose.
 3. If the model must change, edit `model/CronOccurrences.tla` from the code, rerun, and judge the result as in "Read the result". Add a mutant for any new step that protects a property.
 4. Record the confirmation only after you have checked that the model describes the code at the new commit. Run `python .agents/skills/verify-cron-occurrences/scripts/verify.py --record --sync <commit>`. It rewrites the fingerprints in `coverage.json` and the sync commit line in this file. Never run it to silence a `DRIFT` you did not read.
 5. For changes that skipped this skill, use `/maintain-formal-verification-skill`.

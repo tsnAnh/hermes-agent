@@ -360,9 +360,11 @@ def main() -> int:
             if status in ("changed", "error"):
                 failures += 1
 
-    verdict = "PASS" if failures == 0 else f"FAIL ({failures} problem(s))"
-    still_open = f" (known findings still open: {', '.join(open_findings)})" if open_findings else ""
-    print(f"RESULT {verdict}{still_open}")
+    still_open = ", ".join(open_findings)
+    if failures == 0:
+        print("RESULT PASS" + (f" (known findings still open: {still_open})" if still_open else ""))
+    else:
+        print(f"RESULT FAIL ({failures} problem(s))" + (f"; known findings still open: {still_open}" if still_open else ""))
     return 0 if failures == 0 else 1
 
 
