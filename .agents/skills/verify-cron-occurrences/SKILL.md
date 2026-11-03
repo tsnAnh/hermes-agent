@@ -49,7 +49,7 @@ To tell a bug from a modeling error, replay the counterexample against the real 
 
 ## Known findings
 
-All four reproduce on the real store and gate functions with `scripts/replay_findings.py` (the `REPLAY` line). TLC may print the two claims of F-A in the other order. Both orders are reachable.
+F-A to F-D reproduce on the real store and gate functions with `scripts/replay_findings.py` (the `REPLAY` line). F-D2 has a replay and no model run. TLC may print the two claims of F-A in the other order. Both orders are reachable.
 
 F-A, a second run of one occurrence. Run by `finding_lease_expiry`.
 
@@ -59,7 +59,7 @@ F-A, a second run of one occurrence. Run by `finding_lease_expiry`.
 4. The second ticker's worker wins `claim_job_for_fire`, runs S1, and `mark_job_run` clears the claim.
 5. The gateway's queued worker starts. `claim_job_for_fire` finds no live claim and wins. S1 runs again.
 
-It needs a queued worker that waits over 300 s, for example in a saturated `cron.max_parallel_jobs` pool. The job's period must also exceed the lease, or the gateway's own next tick restamps with a fresh `at` first. The second ticker's restore must take the catch-up path, which is the default.
+It needs a queued worker that waits over 300 s, for example in a saturated `cron.max_parallel_jobs` pool. The job's period must also exceed the lease, or the gateway's own next tick restamps with a fresh `at` first. If the restored occurrence is stale and catch-up is off, the second ticker skips it and nothing runs twice.
 
 F-B, a lost occurrence. Run by `finding_stamp_erased`.
 
@@ -69,24 +69,28 @@ F-B, a lost occurrence. Run by `finding_stamp_erased`.
 4. The process dies before S2's worker claims. The dispatch exists only in memory.
 5. After the restart `next_run_at` is past S2 and no stamp exists. Nothing restores S2. Only `last_dispatch` still names it.
 
-It needs a run that overlaps the next slot. Run 1 must also finish, and release its running-set entry, between the tick's scan and its submit. Otherwise `_submit_with_guard` refuses and logs the skip. The replay reaches the state after step 3. Step 4 is the model's step.
+It needs a run that overlaps the next slot. When one process does everything, run 1 must also finish, and release its running-set entry, between the tick's scan and its submit. Otherwise `_submit_with_guard` refuses and logs the skip. With a second ticker there is no such window, because run 1's completion erases that ticker's stamp at any time before its worker claims. The replay reaches the state after step 3. Step 4 is the model's step.
 
 F-C, a stale occurrence lost while the gateway is down. Run by `finding_headless_refusal`.
 
-1. The gateway is down. A system crontab runs `hermes cron tick`, a headless tick. An agent job's occurrence S1 is later than the grace window, which is half a period by default.
+1. No ready gateway serves the home. It is down, starting, or draining. A system crontab runs `hermes cron tick`, a headless tick. An agent job's occurrence S1 is later than the grace window, which is half a period by default.
 2. The scan in `get_due_jobs` finds S1 stale. `fast_forward_missed_recurring` saves `next_run_at` in the future, and the scan stamps `pending_slot` for S1.
 3. `refuse_agent_jobs_without_gateway` sees no ready gateway. `_note_fire_refused` runs `job.pop("pending_slot")` and sets `last_fire_error`. It leaves `next_run_at` where the scan put it.
 4. S1 is off the schedule and has no stamp. The gate's module text says the job fires at the next tick once the gateway is up. It cannot.
 
-It needs a gateway outage longer than the grace window while a headless tick runs. The replay shows the whole loss, with no model step.
+It needs a gateway outage longer than the grace window while a headless tick runs. The replay shows the whole loss, with no model step: a tick inside the window survives the refusal, and the first tick past it loses S1. The loss is also mislabeled. The refusal logs a warning and sets `last_fire_error`, and both say the job runs at the next tick. The scan has already counted a catch-up that never runs (`record_catch_up_occurrence`), and an outage of two slots or more also leaves a `missed` ledger row for it.
 
 F-D, an occurrence dropped with no record. Run by `finding_silent_collapse`.
 
 1. A tick dispatches S1 and queues the worker in `_submit_with_guard`.
 2. S2 comes due while the worker waits.
-3. The worker's `claim_job_for_fire` sets `next_run_at` to `compute_next_run(now)`, past S2. No stamp covers S2, no log line names it, and no `missed` ledger row books it. Only `fast_forward_missed_recurring` books a gap. `_record_run_outcome` and `_advance_after_run` do the same on completion for slots that came due during a run.
+3. The worker's `claim_job_for_fire` sets `next_run_at` to `compute_next_run(now)`, past S2. No stamp covers S2 and no `missed` ledger row books it. Only `fast_forward_missed_recurring` books a gap. `_record_run_outcome` and `_advance_after_run` do the same on completion for slots that came due during a run. That part is read from the code. Neither the model nor the replay exercises it.
 
-The job still runs once, so the run acts as a catch-up for both slots. The gap is invisible in the run history. The code says "no catch-up queue is needed" in `cron/scheduler_tick.py`, so this is the design. It differs from the words "Never drop a slot silently" in `cron/AGENTS.md`. `envelope` assumes these collapses are accounted (`CollapseIsLogged = TRUE`). The replay shows `next_run_at` past S2 and no `missed` row.
+The worker must claim before any tick scans S2. Otherwise the scan stamps S2, `_submit_with_guard` logs that the job is already running, and the skip is accounted.
+
+The job still runs once, so the run acts as a catch-up for both slots. The gap is invisible in the run history. The code says "no catch-up queue is needed" in `cron/scheduler_tick.py`, so this is the design. It differs from the words "Never drop a slot silently" in `cron/AGENTS.md`. `envelope` assumes these collapses are accounted (`CollapseIsLogged = TRUE`). The replay shows `next_run_at` past S2 and no `missed` row, and a control shows that a stale scan does book one.
+
+F-D2 is the same loss at the tick for a short-period job. `_compute_grace_seconds` floors grace at 120 s, so a one-minute job scanned 90 s late counts as on time. `fast_forward_missed_recurring` books nothing and `advance_next_runs` jumps past the slot in between. The replay shows `next_run_at` two slots on and an empty ledger. The model does not cover jobs whose grace is a full period or more.
 
 ## The check can fail
 
@@ -109,7 +113,7 @@ Model: `model/CronOccurrences.tla`. Each action carries the name of the code it 
 |---|---|
 | `AcquireTickLock` | `scheduler_tick._acquire_tick_lock_or_degrade` |
 | `GetDueJobs` | `jobs.get_due_jobs` under `_jobs_lock`. It runs `_evaluate_due_job`, which restores through `_restore_unclaimed_slot`, fast-forwards through `fast_forward_missed_recurring`, then stamps, all in one `save_jobs`. |
-| `RefuseHeadless` | `scheduler_gateway_gate.refuse_agent_jobs_without_gateway` and `_note_fire_refused`, for the crontab ticker when the gateway is down |
+| `RefuseHeadless` | `scheduler_gateway_gate.refuse_agent_jobs_without_gateway` and `_note_fire_refused`, for the crontab ticker when no ready gateway serves the home |
 | `AdvanceNextRuns` | `scheduler_tick._advance_or_drop_recurring` calling `jobs.advance_next_runs` |
 | `SubmitWithGuard` | `scheduler._submit_with_guard` with `try_register_running_job` |
 | `ClaimJobForFire` | `scheduler._process_due_job` calling `jobs.claim_job_for_fire` |
@@ -124,10 +128,10 @@ Covered files and definitions. `coverage.json` holds the fingerprints and call-o
 | File | Definitions |
 |---|---|
 | `cron/scheduler_tick.py` | `_tick_admitted`, `_acquire_tick_lock_or_degrade`, `_advance_or_drop_recurring` |
-| `cron/scheduler_gateway_gate.py` | `refuse_agent_jobs_without_gateway`, `_note_fire_refused` |
-| `cron/jobs.py` | `get_due_jobs`, `_get_due_jobs_locked`, `_evaluate_due_job`, `_restore_unclaimed_slot`, `advance_next_runs`, `claim_job_for_fire`, `heartbeat_fire_claim`, `mark_job_run`, `_record_run_outcome`, `_advance_after_run`, `_claim_is_live`, `_machine_id`, `_job_running_in_this_process`, `_jobs_lock`, `_with_job`, `_under_fire_fence` |
+| `cron/scheduler_gateway_gate.py` | `refuse_agent_jobs_without_gateway`, `_gateway_unavailable`, `_note_fire_refused` |
+| `cron/jobs.py` | `get_due_jobs`, `_get_due_jobs_locked`, `_evaluate_due_job`, `_DueScan.persist`, `_DueJob.recompute_next`, `_compute_grace_seconds`, `_restore_unclaimed_slot`, `advance_next_runs`, `claim_job_for_fire`, `heartbeat_fire_claim`, `mark_job_run`, `_record_run_outcome`, `_advance_after_run`, `_claim_is_live`, `_machine_id`, `_job_running_in_this_process`, `_jobs_lock`, `_with_job`, `_under_fire_fence` |
 | `cron/occurrences.py` | `unclaimed_pending_slot`, `pending_slot_stamp` |
-| `cron/missed_runs.py` | `fast_forward_missed_recurring` |
+| `cron/missed_runs.py` | `fast_forward_missed_recurring`, `job_catches_up`, `count_missed_slots`, `_book_missed` |
 | `cron/scheduler_ownership.py` | `_claim_owner_is_dead` |
 | `cron/scheduler.py` | `_acquire_tick_lock`, `_submit_with_guard`, `try_register_running_job`, `release_running_job`, `is_job_running`, `_process_due_job` |
 | `cron/constants.py` | `FIRE_CLAIM_TTL_SECONDS` |
@@ -139,10 +143,10 @@ Sync commit: 48058f84b39fc81de234f815c2be9a480196933f
 - Bounds. Four occurrences, one recurring job, two tickers, at most three crashes, three incarnations per ticker. The `envelope` run explores about 600,000 states.
 - `envelope` assumes the stamp lease never lapses while its owner's dispatch is queued (`StampLeaseCanExpire = FALSE`). The code lets it lapse, which is F-A.
 - `envelope` assumes a run ends before the next slot comes due (`RunsFinishWithinSlot = TRUE`). The code lets runs overlap, which is F-B.
-- `envelope` assumes a headless tick never meets a down gateway (`CrontabRefusesWithoutGateway = FALSE`), which is F-C.
+- `envelope` assumes a headless tick always finds a ready gateway (`CrontabRefusesWithoutGateway = FALSE`), which is F-C. With the flag on, the refusal can happen at any time, because the gate refuses in every state but ready (down, starting, draining).
 - `envelope` assumes a claim or a completion that jumps `next_run_at` forward accounts for every occurrence it passes (`CollapseIsLogged = TRUE`). The code does not log that, which is F-D.
 - All runs assume a tick's scan, advance, and submit happen at one clock instant (`TickIsInstant = TRUE`). The real gap is milliseconds to a few seconds.
-- Grace. With the default grace of half a period, a scan that sees an occurrence in its own slot may find it stale or fresh, and one a full slot late is stale (`StaleAfter = 1`). A larger `grace_minutes` is not modeled.
+- Grace. The default grace is half a period, clamped to 120 s through 2 h. The model covers jobs whose grace is below one period, which means a period of 4 minutes or more. A scan that sees an occurrence in its own slot may find it stale or fresh, and one a full slot late is stale (`StaleAfter = 1`). For shorter periods, or a larger `grace_minutes`, a fresh scan can be a period or more late and the tick drops the slots in between with no booking. That is F-D2. It is replayed and not modeled.
 - A process is dead exactly when it has crashed and not restarted, which is what `_claim_owner_is_dead` proves for an owner on the same host. A claim stays live while its owner process lives. Cross-host owners and an explicit `HERMES_MACHINE_ID` are not modeled.
 - The second ticker stands for another gateway on the store, or for `hermes cron tick`. A headless tick refuses agent jobs while no ready gateway exists, so a second ticker that runs a job after the gateway died stands for a `no_agent` job or another gateway.
 - `MarkJobRun` clears the store and the running-set entry in one step. The real code releases the entry a few statements later. The model releases the tick lock at `SubmitWithGuard`. A synchronous `hermes cron tick` holds it longer.

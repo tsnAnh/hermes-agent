@@ -197,6 +197,30 @@
     },
     {
       "file": "cron/jobs.py",
+      "name": "_DueScan.persist",
+      "actions": [
+        "GetDueJobs"
+      ],
+      "sha256": "982751021a68d54cc3a3e10be95465d06380e62a74ee630a830d8746e088aea8"
+    },
+    {
+      "file": "cron/jobs.py",
+      "name": "_DueJob.recompute_next",
+      "actions": [
+        "GetDueJobs"
+      ],
+      "sha256": "d973646084c1b3e76f16d04d45cd0e48fe633609957ce2631c1473397af2f8d6"
+    },
+    {
+      "file": "cron/jobs.py",
+      "name": "_compute_grace_seconds",
+      "actions": [
+        "GetDueJobs"
+      ],
+      "sha256": "ff73ca4f66193a7bc2076c76b3221b0154f89f3b22d85b027da34e4b72147bf3"
+    },
+    {
+      "file": "cron/jobs.py",
       "name": "_restore_unclaimed_slot",
       "actions": [
         "GetDueJobs"
@@ -250,6 +274,30 @@
       "sha256": "c3671c51311571deb2e92e4cd1fd6af9ea2c9764e19cd13261b7e4cc6144075d"
     },
     {
+      "file": "cron/missed_runs.py",
+      "name": "job_catches_up",
+      "actions": [
+        "GetDueJobs"
+      ],
+      "sha256": "ea79cec2e3ed0f47117879b87b408a41ec7b5e16b902e17f9e96632079d135e5"
+    },
+    {
+      "file": "cron/missed_runs.py",
+      "name": "count_missed_slots",
+      "actions": [
+        "GetDueJobs"
+      ],
+      "sha256": "addfb3905d3d5d4cc73feaa1870e03d58f85d37706352a2aa77d1870ac881a42"
+    },
+    {
+      "file": "cron/missed_runs.py",
+      "name": "_book_missed",
+      "actions": [
+        "GetDueJobs"
+      ],
+      "sha256": "51d98ed9e87383e0349df856f29d6596652f5138798860b951e8be0b237724b6"
+    },
+    {
       "file": "cron/scheduler_gateway_gate.py",
       "name": "refuse_agent_jobs_without_gateway",
       "actions": [
@@ -266,6 +314,14 @@
           "why": "a refused agent job has its stamp erased after the scan may already have moved next_run_at (finding F-C)"
         }
       ]
+    },
+    {
+      "file": "cron/scheduler_gateway_gate.py",
+      "name": "_gateway_unavailable",
+      "actions": [
+        "RefuseHeadless"
+      ],
+      "sha256": "966514fe76530272eeb5601c4625a714dc9ec908b0f8d12997715e6a103c8acb"
     },
     {
       "file": "cron/scheduler_gateway_gate.py",

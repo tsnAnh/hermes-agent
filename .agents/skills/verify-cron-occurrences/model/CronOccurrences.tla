@@ -153,7 +153,6 @@ GetDueJobs(p) ==
 RefuseHeadless(p) ==
     /\ CrontabRefusesWithoutGateway
     /\ p = "crontab"
-    /\ ~alive["gateway"]
     /\ phase[p] = "scanned"
     /\ stamp' = None
     /\ stampExpired' = FALSE

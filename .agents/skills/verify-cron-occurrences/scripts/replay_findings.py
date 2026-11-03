@@ -103,9 +103,9 @@ def due_snapshot(job_id, evidence, label):
     return due[0]
 
 
-def new_job(clock, procs):
+def new_job(clock, procs, schedule="every 5m"):
     procs.select("A")
-    job = jobs.create_job(prompt="replay", schedule="every 5m", name="replay-job")
+    job = jobs.create_job(prompt="replay", schedule=schedule, name="replay-job")
     return job["id"], stored(job["id"])["next_run_at"]
 
 
@@ -164,7 +164,7 @@ def scenario_fa(root):
     procs = Processes()
     with jobs.use_cron_store(root):
         install(clock, procs)
-        job_id, s1 = new_job(clock, procs)
+        job_id, s1 = new_job(clock, procs, "every 1h")
         s1_dt = datetime.fromisoformat(s1)
         canonical_s1 = cron.occurrences.scheduled_instant(s1)
         evidence.append(f"S1={s1} canonical={canonical_s1}")
@@ -214,7 +214,7 @@ def scenario_fc(root):
     original_gate = cron.scheduler_gateway_gate._gateway_unavailable
     with jobs.use_cron_store(root):
         install(clock, procs)
-        procs.select("gateway")
+        procs.select("crontab")
         job = jobs.create_job(prompt="replay", schedule="every 1h", name="replay-job")
         job_id = job["id"]
         s1 = stored(job_id)["next_run_at"]
@@ -222,36 +222,43 @@ def scenario_fc(root):
         canonical_s1 = cron.occurrences.scheduled_instant(s1)
         evidence.append(f"S1={s1} canonical={canonical_s1}")
 
-        clock.value = s1_dt + timedelta(seconds=5)
-        due_snapshot(job_id, evidence, "step1 (gateway)")
-        require(jobs.advance_next_runs([job_id]) == 1, "step1: advance_next_runs did not advance")
-        snap = note(evidence, "step1 stored (gateway died before its worker claimed)", job_id)
-        require(snap["pending_slot"] == s1, f"step1: pending_slot {snap['pending_slot']} != S1 {s1}")
-
-        clock.value = s1_dt + timedelta(hours=2)
-        procs.select("crontab")
         cron.scheduler_gateway_gate._gateway_unavailable = lambda home: "the gateway is absent"
         try:
+            clock.value = s1_dt + timedelta(seconds=5)
             due = [j for j in jobs.get_due_jobs() if j["id"] == job_id]
-            require(len(due) == 1, f"step2: get_due_jobs returned {len(due)} snapshots for the job, expected 1")
+            require(len(due) == 1, f"tick 1: get_due_jobs returned {len(due)} snapshots for the job, expected 1")
+            kept = cron.scheduler_gateway_gate.refuse_agent_jobs_without_gateway(due)
+            first = note(evidence, "tick 1 stored (after headless refusal)", job_id)
+            evidence.append(f"tick 1: kept={len(kept)} last_fire_error={stored(job_id).get('last_fire_error')}")
+            require(not kept, "tick 1: the gate kept the job although the gateway is absent")
+            require(first["pending_slot"] is None, f"tick 1: pending_slot {first['pending_slot']} is not None")
+            require(first["next_run_at"] == s1, f"tick 1: next_run_at {first['next_run_at']} != S1 {s1}")
+
+            clock.value = s1_dt + timedelta(minutes=31)
+            evidence.append(f"tick 2: clock advanced to {clock.value.isoformat()} (past the 30 min grace)")
+            due = [j for j in jobs.get_due_jobs() if j["id"] == job_id]
+            require(len(due) == 1, f"tick 2: get_due_jobs returned {len(due)} snapshots for the job, expected 1")
             require(due[0].get("_scheduled_instant") == canonical_s1,
-                    f"step2: _scheduled_instant {due[0].get('_scheduled_instant')} != {canonical_s1}")
-            before = note(evidence, "step2 stored (crontab scan)", job_id)
-            require(datetime.fromisoformat(before["next_run_at"]) > s1_dt,
-                    f"step2: scan did not fast-forward next_run_at ({before['next_run_at']})")
+                    f"tick 2: _scheduled_instant {due[0].get('_scheduled_instant')} != {canonical_s1}")
+            before = note(evidence, "tick 2 stored (after the scan, before the gate)", job_id)
+            require(datetime.fromisoformat(before["next_run_at"]) > clock.value,
+                    f"tick 2: scan left next_run_at {before['next_run_at']} not after the clock")
             kept = cron.scheduler_gateway_gate.refuse_agent_jobs_without_gateway(due)
         finally:
             cron.scheduler_gateway_gate._gateway_unavailable = original_gate
-        after = note(evidence, "step3 stored (after headless refusal)", job_id)
+        after = note(evidence, "tick 2 stored (after headless refusal)", job_id)
         error = stored(job_id).get("last_fire_error")
-        evidence.append(f"step3: kept={len(kept)} last_fire_error={error}")
+        statuses = [row["status"] for row in cron.executions.list_executions(job_id=job_id)]
+        evidence.append(f"tick 2: kept={len(kept)} last_fire_error={error}")
+        evidence.append(f"ledger statuses for the job: {statuses} (no row: the scan stamped a catch-up in pending_slot and the gate cleared it without running it)")
 
         reproduced = (
             not kept
             and after["pending_slot"] is None
-            and datetime.fromisoformat(after["next_run_at"]) > s1_dt
+            and datetime.fromisoformat(after["next_run_at"]) > clock.value
             and bool(error)
         )
+        evidence.append(f"S1 occurrence durable record after tick 2: {'none' if reproduced else 'present'}")
     return reproduced, evidence
 
 
@@ -298,8 +305,43 @@ def scenario_fd(root):
     return reproduced, evidence
 
 
+def scenario_fd2(root):
+    evidence = []
+    clock = Clock(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC))
+    procs = Processes()
+    with jobs.use_cron_store(root):
+        install(clock, procs)
+        job_id, s1 = new_job(clock, procs, "every 1m")
+        s1_dt = datetime.fromisoformat(s1)
+        evidence.append(f"S1={s1}")
+
+        clock.value = s1_dt + timedelta(seconds=90)
+        evidence.append(f"clock={clock.value.isoformat()}")
+        due_snapshot(job_id, evidence, "step1 (A)")
+        kind = (stored(job_id).get("last_dispatch") or {}).get("kind")
+        evidence.append(f"step1: last_dispatch kind={kind}")
+        require(kind in (None, "on_time"), f"step1: last_dispatch kind {kind} is not on_time")
+        before = note(evidence, "step1 stored (before advance)", job_id)
+
+        require(jobs.advance_next_runs([job_id]) == 1, "step2: advance_next_runs did not advance")
+        after = note(evidence, "step2 stored (after advance)", job_id)
+        statuses = [row["status"] for row in cron.executions.list_executions(job_id=job_id)]
+        evidence.append(f"step2: ledger statuses for the job: {statuses}")
+
+        next_dt = datetime.fromisoformat(after["next_run_at"])
+        reproduced = next_dt >= s1_dt + timedelta(minutes=2) and "missed" not in statuses
+        evidence.append(f"next_run_at before advance={before['next_run_at']} after advance={after['next_run_at']}")
+
+        clock.value = next_dt + timedelta(minutes=20)
+        jobs.get_due_jobs()
+        control = [row["status"] for row in cron.executions.list_executions(job_id=job_id)]
+        require("missed" in control, "control: a stale scan did not book a missed row, so the ledger check proves nothing")
+        evidence.append(f"control: a stale scan books a gap, ledger statuses now {control}")
+    return reproduced, evidence
+
+
 def main():
-    scenarios = (("F-A", scenario_fa), ("F-B", scenario_fb), ("F-C", scenario_fc), ("F-D", scenario_fd))
+    scenarios = (("F-A", scenario_fa), ("F-B", scenario_fb), ("F-C", scenario_fc), ("F-D", scenario_fd), ("F-D2", scenario_fd2))
     results = {}
     harness_failed = False
     for name, runner in scenarios:

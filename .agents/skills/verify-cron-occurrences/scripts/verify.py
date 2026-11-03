@@ -76,8 +76,14 @@ def ensure_tla_jar(explicit: str | None) -> Path:
     jar = cache_dir() / f"tla2tools-{TLA_RELEASE}.jar"
     if jar.is_file() and sha256_of(jar) == TLA_SHA256:
         return jar
-    jar.parent.mkdir(parents=True, exist_ok=True)
-    partial = jar.with_suffix(".part")
+    try:
+        jar.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f"cannot create the cache directory {jar.parent}: {exc}\n"
+            f"Pass --tla2tools PATH (sha256 must be {TLA_SHA256}) to skip the download."
+        ) from exc
+    partial = jar.with_suffix(f".{os.getpid()}.part")
     try:
         with urllib.request.urlopen(TLA_URL, timeout=120) as response, partial.open("wb") as handle:
             shutil.copyfileobj(response, handle)
@@ -98,9 +104,12 @@ def find_java() -> str:
     java = shutil.which("java")
     if not java:
         raise SystemExit(f"java {MIN_JAVA_MAJOR}+ is required to run TLC and was not found on PATH")
-    probe = subprocess.run(
-        [java, "-version"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, check=False
-    )
+    try:
+        probe = subprocess.run(
+            [java, "-version"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"{java} -version did not answer within 60 s; java {MIN_JAVA_MAJOR}+ is required to run TLC") from exc
     match = re.search(r'version "(\d+)', probe.stderr)
     if not match or int(match.group(1)) < MIN_JAVA_MAJOR:
         raise SystemExit(f"java {MIN_JAVA_MAJOR}+ is required, found: {probe.stderr.strip().splitlines()[-1:]}")
@@ -168,16 +177,82 @@ def canonical(node: object) -> str:
     return repr(node)
 
 
+DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+NESTED_BODIES = ("body", "orelse", "finalbody")
+
+
+def target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return set().union(*(target_names(element) for element in target.elts)) if target.elts else set()
+    return set()
+
+
+def bound_names(node: ast.stmt) -> set[str]:
+    if isinstance(node, DEFINITIONS):
+        return {node.name}
+    if isinstance(node, ast.Assign):
+        return set().union(*(target_names(target) for target in node.targets))
+    if isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+        return target_names(node.target)
+    if isinstance(node, ast.Import):
+        return {alias.asname or alias.name.split(".")[0] for alias in node.names}
+    if isinstance(node, ast.ImportFrom):
+        return {alias.asname or alias.name for alias in node.names}
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        return target_names(node.target)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return set().union(*(target_names(item.optional_vars) for item in node.items if item.optional_vars))
+    return set()
+
+
+def nested_statements(node: ast.stmt) -> list[ast.stmt]:
+    if isinstance(node, DEFINITIONS):
+        return []
+    statements: list[ast.stmt] = []
+    for field_name in NESTED_BODIES:
+        statements.extend(getattr(node, field_name, None) or [])
+    if isinstance(node, (ast.Try, ast.TryStar)):
+        for handler in node.handlers:
+            statements.extend(handler.body)
+    return statements
+
+
 def top_level_bindings(tree: ast.Module, name: str) -> list[ast.AST]:
     found: list[ast.AST] = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            found.append(node)
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-        if any(isinstance(target, ast.Name) and target.id == name for target in targets):
-            found.append(node)
+
+    def visit(statements: list[ast.stmt]) -> None:
+        for node in statements:
+            if name in bound_names(node):
+                found.append(node)
+            visit(nested_statements(node))
+
+    visit(tree.body)
     return found
+
+
+def resolve_definition(tree: ast.Module, name: str) -> tuple[list[ast.AST], ast.AST | None, str | None]:
+    head, _, method = name.partition(".")
+    bindings = top_level_bindings(tree, head)
+    if not bindings:
+        return bindings, None, "definition moved or renamed"
+    last = bindings[-1]
+    if not method:
+        if isinstance(last, (*DEFINITIONS, ast.Assign, ast.AnnAssign)):
+            return bindings, last, None
+        return bindings, None, f"{head} is rebound by a non-definition at line {last.lineno}"
+    if not isinstance(last, ast.ClassDef):
+        return bindings, None, f"{head} is rebound by a non-class at line {last.lineno}"
+    methods = [
+        node for node in last.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method
+    ]
+    if not methods:
+        return bindings, None, f"method {method} is gone from class {head}"
+    return bindings, methods[-1], None
 
 
 def callee_name(call: ast.Call) -> str | None:
@@ -243,13 +318,12 @@ def check_code(coverage: dict) -> tuple[list[str], dict[str, str]]:
         except SyntaxError as exc:
             problems.append(f"MISSING {key}: file does not parse ({exc.msg} at line {exc.lineno})")
             continue
-        bindings = top_level_bindings(tree, entry["name"])
-        definition = bindings[-1] if bindings else None
+        bindings, definition, absent_reason = resolve_definition(tree, entry["name"])
         if len(bindings) > 1:
             lines = ", ".join(str(node.lineno) for node in bindings)
             problems.append(f"DUPLICATE {key}: bound {len(bindings)} times at top level (lines {lines}); the last one wins")
         if definition is None:
-            problems.append(f"MISSING {key}: definition moved or renamed; re-read the model action(s) {entry['actions']}")
+            problems.append(f"MISSING {key}: {absent_reason}; re-read the model action(s) {entry['actions']}")
             continue
         current[key] = hashlib.sha256(canonical(definition).encode("utf-8")).hexdigest()
         if current[key] != entry["sha256"]:
@@ -362,6 +436,25 @@ def describe(run: ModelRun, entry: dict) -> str:
     return f"{entry['kind']:<8} {run.cfg:<30} {run.outcome:<24} {label:<4} {states} {run.seconds:5.1f}s"
 
 
+def validate_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> set[str] | None:
+    if args.model_only and args.code_only:
+        parser.error("--model-only and --code-only cannot be combined")
+    if args.require_replay:
+        skipping = [
+            flag for flag, on in (
+                ("--no-replay", args.no_replay), ("--only", args.only is not None), ("--code-only", args.code_only)
+            ) if on
+        ]
+        if skipping:
+            parser.error(f"--require-replay cannot be combined with {', '.join(skipping)}, which skip the replay")
+    if args.only is None:
+        return None
+    wanted = {name.strip() for name in args.only.split(",") if name.strip()}
+    if not wanted:
+        parser.error("--only needs at least one cfg name")
+    return wanted
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Model-check and drift-check the cron occurrence protocol.")
     parser.add_argument("--only", help="comma list of cfg names to run")
@@ -375,10 +468,8 @@ def main() -> int:
     parser.add_argument("--sync", help="commit SHA the verification was confirmed against")
     args = parser.parse_args()
 
-    if args.model_only and args.code_only:
-        parser.error("--model-only and --code-only cannot be combined")
+    wanted = validate_flags(parser, args)
     coverage = load_coverage()
-    wanted = set(args.only.split(",")) if args.only else None
     if wanted:
         valid = [entry["cfg"] for entry in coverage["runs"]]
         unknown = sorted(wanted - set(valid))
@@ -392,6 +483,7 @@ def main() -> int:
 
     failures = 0
     open_findings: list[str] = []
+    replay_note: str | None = "replay not run"
     if not args.model_only:
         problems = check_sync(coverage) + check_code(coverage)[0]
         print(f"CODE   {len(coverage['covered'])} covered definitions, sync {coverage['sync_commit'][:12]}")
@@ -421,14 +513,20 @@ def main() -> int:
         if not args.no_replay and not wanted:
             status, detail = run_replay()
             print(f"REPLAY {status}: {detail}")
+            replay_note = "replay skipped" if status == "skipped" else None
             if status in ("changed", "error") or (status == "skipped" and args.require_replay):
                 failures += 1
 
     still_open = ", ".join(open_findings)
     if failures == 0:
-        print("RESULT PASS" + (f" (known findings still open: {still_open})" if still_open else ""))
+        parts = ([f"known findings still open: {still_open}"] if still_open else []) + ([replay_note] if replay_note else [])
+        print("RESULT PASS" + (f" ({'; '.join(parts)})" if parts else ""))
     else:
-        print(f"RESULT FAIL ({failures} problem(s))" + (f"; known findings still open: {still_open}" if still_open else ""))
+        print(
+            f"RESULT FAIL ({failures} problem(s))"
+            + (f"; known findings still open: {still_open}" if still_open else "")
+            + (f"; {replay_note}" if replay_note else "")
+        )
     return 0 if failures == 0 else 1
 
 
